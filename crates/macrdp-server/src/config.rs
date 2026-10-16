@@ -64,7 +64,7 @@ impl Default for ClipboardConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
     pub port: u16,
@@ -96,6 +96,10 @@ pub struct ServerConfig {
     pub resolution: Option<String>,
     /// Show cursor in capture (default: true)
     pub show_cursor: Option<bool>,
+    /// Give each session a virtual display at the client's requested size, 1:1
+    /// (default: true). Needs resolution "auto" and no fixed width/height;
+    /// false scales the Mac's own display instead.
+    pub match_client_resolution: Option<bool>,
     /// Target bitrate in Mbps (default: auto-calculated from resolution/fps/quality)
     /// Override this to force a specific bitrate, e.g. 50 for 50 Mbps.
     pub bitrate_mbps: Option<u32>,
@@ -132,6 +136,7 @@ impl Default for ServerConfig {
             chroma_mode: None,
             resolution: None,
             show_cursor: None,
+            match_client_resolution: None,
             bitrate_mbps: None,
             skip_unchanged: None,
             idle_keyframe_sec: None,

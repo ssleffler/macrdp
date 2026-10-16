@@ -14,5 +14,5 @@
     <choice id="com.macrdp.server" visible="false">
         <pkg-ref id="com.macrdp.server"/>
     </choice>
-    <pkg-ref id="com.macrdp.server" version="0.1.1" onConclusion="none">macrdp-component.pkg</pkg-ref>
+    <pkg-ref id="com.macrdp.server" version="0.2.1" onConclusion="none">macrdp-component.pkg</pkg-ref>
 </installer-gui-script>

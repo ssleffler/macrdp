@@ -1,4 +1,4 @@
-macrdp 0.1.1 — RDP server for macOS
+macrdp 0.2.1 — RDP server for macOS
 =====================================
 
 Lets you connect to this Mac from Windows Remote Desktop (mstsc), the Windows
@@ -8,6 +8,8 @@ Requires macOS 14 (Sonoma) or later. Works on Apple Silicon and Intel Macs.
 No developer tools needed.
 
 This build includes:
+  - The Mac's desktop matches your RDP window size, 1:1 (set when you connect)
+  - The lock screen shows over RDP (no more frozen picture after the Mac locks)
   - Mac cursor shapes on the client (link hand, text beam, busy, resize…)
   - Windows-style scrolling (3 lines per wheel notch)
   - Windows follow the pointer while you drag them
@@ -15,59 +17,55 @@ This build includes:
 
 INSTALL
 -------
-1. Copy macrdp-0.1.1.pkg to the Mac and double-click it.
+1. Copy macrdp-0.2.1.pkg to the Mac and double-click it.
    (Build it with packaging/macos/build-pkg.sh; it lands in packaging/macos/dist/.)
 
    The package isn't signed by an Apple developer, so macOS blocks it the
    first time. To allow it:
      System Settings > Privacy & Security > scroll down > "Open Anyway"
    Or in Terminal, from the folder with the file:
-     sudo installer -pkg macrdp-0.1.1.pkg -target /
+     sudo installer -pkg macrdp-0.2.1.pkg -target /
 
-2. Install it while logged in as the user people will connect to.
-   At the end a window shows the RDP username and a new random password.
-   Copy the password somewhere safe. (It's also in the config file below.)
+2. Install it while logged in as the user people will connect to. It installs
+   /Applications/macrdp.app (a background app, no Dock icon) and starts it.
 
-3. Grant two permissions. Without them you get a black screen and/or
-   no keyboard and mouse control.
+3. Right away macOS asks for two permissions for "macrdp". Allow both:
+     - Screen & System Audio Recording  (otherwise: black screen)
+     - Accessibility                    (otherwise: no keyboard/mouse control)
+   Click "Open System Settings" in each prompt and switch macrdp ON.
+   macrdp restarts by itself once Accessibility is on.
 
-   System Settings > Privacy & Security:
-     - Screen & System Audio Recording
-     - Accessibility
-   In each: click +, press Cmd+Shift+G, paste /usr/local/bin/macrdp-server,
-   add it and make sure its switch is ON.
-
-   macOS may also show its own prompts for these. An Accessibility prompt
-   only adds macrdp-server to the list; you still have to switch it on.
-
-4. Restart macrdp so it picks up the permissions:
-     launchctl kickstart -k gui/$(id -u)/com.macrdp.server
-   (or log out and back in). It now starts on every login.
+4. A macrdp window then shows the RDP username and, on a first install, a new
+   random password. Copy it somewhere safe (it's also in the config file).
 
 5. Check it worked:
      grep -E "Screen Recording|Accessibility" ~/Library/Logs/macrdp/macrdp.log | tail -2
    Both lines should say [OK].
+
+UPDATING: install the new .pkg over the old one. macOS sees each build as a new
+program, so it asks for both permissions again during the install — allow them
+as in step 3. If you only reach the Mac over RDP, have another way in while
+updating (e.g. Screen Sharing or RustDesk) to click the prompts.
+
+Upgrading from 0.1.x/0.2.0 (which ran /usr/local/bin/macrdp-server): the old
+"macrdp-server" entries in both permission lists are no longer used; remove
+them with the – button.
 
 
 CONNECT
 -------
 From your RDP client, connect to  <this-mac's-IP>:3389
 Find the IP in System Settings > Wi-Fi (or Network) > Details.
-Use the username and password from step 2.
+Use the username and password from step 4.
 
 
 IF THE PERMISSIONS DON'T TAKE
 -----------------------------
-If the log still shows [!!] for Accessibility even though the switch is on,
-macOS is holding a stale entry. Clear it and grant it again:
-  tccutil reset Accessibility com.macrdp.server
-  (remove any leftover macrdp-server entries with the – button)
+If the log still shows [!!] even though macrdp is switched on, clear the
+entries and start macrdp so it asks again:
+  sudo tccutil reset Accessibility com.macrdp.server
+  sudo tccutil reset ScreenCapture com.macrdp.server
   launchctl kickstart -k gui/$(id -u)/com.macrdp.server
-Then switch macrdp-server on when it reappears, and restart once more.
-Screen Recording works the same way:  tccutil reset ScreenCapture com.macrdp.server
-
-After installing an UPDATE of macrdp, you have to do this again: macOS treats
-each new build as a new program.
 
 
 SETTINGS
@@ -76,11 +74,17 @@ SETTINGS
 After editing, restart it:
   launchctl kickstart -k gui/$(id -u)/com.macrdp.server
 
+Desktop size: each connection gets a virtual display at your RDP window's size
+(800x600 up to 4096x2304). Resize the client window, then reconnect to change it.
+macOS may rearrange windows when you connect and disconnect.
+To keep the Mac's own display (scaled) instead, add:
+  match_client_resolution = false
+
 To use less bandwidth, add for example:
   bitrate_mbps = 20
   frame_rate = 30
 
-Logs: ~/Library/Logs/macrdp/
+Logs: ~/Library/Logs/macrdp/macrdp.log (kept across restarts, rotated at 10 MB)
 
 
 START AFTER A POWER CUT

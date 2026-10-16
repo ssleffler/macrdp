@@ -65,6 +65,11 @@ fn declare_activity(force: bool) {
     }
 }
 
+/// When remote input last declared user activity (within ACTIVITY_INTERVAL)
+pub fn last_user_activity() -> Option<Instant> {
+    ACTIVITY.lock().unwrap().map(|(_, at)| at)
+}
+
 /// Keeps the display from sleeping while it is alive.
 pub struct DisplayAwake(IOPMAssertionID);
 

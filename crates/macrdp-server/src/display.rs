@@ -7,11 +7,13 @@ use ironrdp_server::{
 };
 use macrdp_audio::SharedAudioTx;
 use macrdp_capture::cursor::{self, CursorImage};
+use macrdp_capture::virtual_display::VirtualDisplay;
 use macrdp_capture::{CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, ScreenCapturer};
 use macrdp_encode::{self, Quality, VideoEncoder};
 use macrdp_input::power::DisplayAwake;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::handler::MouseCoordMapper;
 use crate::perf_stats::SharedPerfStats;
@@ -24,8 +26,32 @@ const TILE_SIZE: u16 = 64;
 /// 65536 pixels ≈ 256×256 rect ≈ 256 KB of raw BGRA data.
 const UNCOMPRESSED_MAX_PIXELS: u32 = 65536;
 
-/// How often to check whether the Mac's cursor shape changed
-const CURSOR_POLL: std::time::Duration = std::time::Duration::from_millis(33);
+/// Size limits for the client-sized virtual display. The maximum is the
+/// largest frame VideoToolbox's H.264 encoder accepts.
+const VIRTUAL_MIN: (u32, u32) = (800, 600);
+const VIRTUAL_MAX: (u32, u32) = (4096, 2304);
+
+/// Fits a client-requested size into the virtual display limits, keeping its
+/// aspect ratio, with even dimensions (required by the H.264 encoder).
+fn fit_virtual_size(width: u16, height: u16) -> (u16, u16) {
+    let (w, h) = (width.max(1) as f64, height.max(1) as f64);
+    let shrink = (VIRTUAL_MAX.0 as f64 / w).min(VIRTUAL_MAX.1 as f64 / h).min(1.0);
+    let even = |v: f64, min: u32| ((v as u32).max(min) & !1) as u16;
+    (even(w * shrink, VIRTUAL_MIN.0), even(h * shrink, VIRTUAL_MIN.1))
+}
+
+/// How often the frame loop wakes up without a new frame (cursor shape checks,
+/// lock-screen fallback frames, stall detection)
+const POLL_INTERVAL: Duration = Duration::from_millis(33);
+
+/// A paused capture (screen locked) switches to CoreGraphics after this long
+const PAUSED_FALLBACK_AFTER: Duration = Duration::from_millis(300);
+
+/// Restart screen capture if it delivers nothing for this long while the
+/// client is sending input...
+const STALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// ...at most this often
+const STALL_RESTART_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Convert a captured frame into tiled BitmapUpdate chunks
 pub fn frame_to_bitmap_updates(frame: &CapturedFrame, tile_size: u16) -> Vec<BitmapUpdate> {
@@ -98,6 +124,11 @@ pub struct MacDisplay {
     show_cursor: bool,
     base_bitrate: u32,
     gfx_state: Arc<Mutex<GfxState>>,
+    /// Give each session its own display at the client's size (match_client_resolution)
+    match_client: bool,
+    /// Mouse mapper's logical size for the Mac's own display, used when no
+    /// virtual display is active
+    native_logical: (u16, u16),
     /// Shared audio sender slot — updated per connection by AudioFactory
     shared_audio_tx: Option<SharedAudioTx>,
     /// Shared performance statistics collector (None = disabled)
@@ -126,14 +157,64 @@ impl MacDisplay {
         let (max_w, max_h) = macrdp_capture::detect_display_scale()
             .map(|scale| (width.max((width as u32 * scale) as u16), height.max((height as u32 * scale) as u16)))
             .unwrap_or((width.max(3840), height.max(2160)));
+        let native_logical = coord_mapper.logical_size();
         Self {
             width, height,
             max_width: max_w, max_height: max_h,
+            match_client: false,
+            native_logical,
             coord_mapper,
             fixed_resolution,
             frame_rate, quality, encoder_pref, mode_444, show_cursor, base_bitrate, gfx_state,
             shared_audio_tx,
             perf_stats,
+        }
+    }
+
+    /// Create a display at each client's requested size (needs resolution "auto").
+    pub fn match_client_resolution(mut self, enabled: bool) -> Self {
+        self.match_client = enabled && !self.fixed_resolution;
+        if self.match_client {
+            tracing::info!("Each session gets a virtual display at the client's resolution");
+        }
+        self
+    }
+
+    /// Creates this session's virtual display at the current size and points
+    /// capture and mouse mapping at it. Falls back to the Mac's own display.
+    async fn prepare_display(&mut self, capture_config: &mut CaptureConfig) -> Option<VirtualDisplay> {
+        if !self.match_client {
+            return None;
+        }
+        let (w, h) = (self.width as u32, self.height as u32);
+        match tokio::task::spawn_blocking(move || VirtualDisplay::new(w, h)).await {
+            Ok(Ok(vd)) => {
+                capture_config.display_id = Some(vd.display_id());
+                self.coord_mapper.set_logical_size(self.width, self.height);
+                Some(vd)
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Couldn't create a client-sized display, scaling the Mac's display instead: {e}");
+                self.use_native_display();
+                None
+            }
+            Err(e) => {
+                tracing::warn!("Virtual display task failed: {e}");
+                self.use_native_display();
+                None
+            }
+        }
+    }
+
+    /// Scale the Mac's own display to the session size (the pre-virtual-display behaviour).
+    fn use_native_display(&mut self) {
+        let (lw, lh) = self.native_logical;
+        self.coord_mapper.set_logical_size(lw, lh);
+        let (w, h) = (self.width.min(self.max_width), self.height.min(self.max_height));
+        if (w, h) != (self.width, self.height) {
+            self.width = w;
+            self.height = h;
+            self.coord_mapper.update_rdp_size(w, h);
         }
     }
 }
@@ -149,8 +230,11 @@ impl RdpServerDisplay for MacDisplay {
             tracing::debug!("Ignoring resize request — resolution is fixed by config");
             return;
         }
-        let w = width.min(self.max_width);
-        let h = height.min(self.max_height);
+        let (w, h) = if self.match_client {
+            fit_virtual_size(width, height)
+        } else {
+            (width.min(self.max_width), height.min(self.max_height))
+        };
         if w > 0 && h > 0 && (w != self.width || h != self.height) {
             tracing::info!(
                 old_w = self.width, old_h = self.height,
@@ -167,7 +251,7 @@ impl RdpServerDisplay for MacDisplay {
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
-        let capture_config = CaptureConfig {
+        let mut capture_config = CaptureConfig {
             width: self.width as u32,
             height: self.height as u32,
             frame_rate: self.frame_rate,
@@ -177,7 +261,13 @@ impl RdpServerDisplay for MacDisplay {
                 CapturePixelFormat::Bgra
             },
             show_cursor: self.show_cursor,
+            display_id: None,
         };
+        // Give this session a display at the client's size (dropped with the session)
+        let virtual_display = self.prepare_display(&mut capture_config).await;
+        capture_config.width = self.width as u32;
+        capture_config.height = self.height as u32;
+
         // Wake the display before capturing: while it's off macOS draws nothing,
         // so the client would get a black screen. Held until the client leaves.
         let display_awake = DisplayAwake::new();
@@ -185,7 +275,7 @@ impl RdpServerDisplay for MacDisplay {
         // Read the current audio sender from the shared slot (set by AudioFactory per connection)
         let audio_tx = self.shared_audio_tx.as_ref()
             .and_then(|shared| shared.lock().unwrap().clone());
-        let capturer = ScreenCapturer::new(capture_config.clone(), audio_tx).await?;
+        let capturer = ScreenCapturer::new(capture_config.clone(), audio_tx.clone()).await?;
 
         // Create H.264 encoder with configured quality and encoder preference
         let encoder = macrdp_encode::create_encoder(
@@ -219,6 +309,13 @@ impl RdpServerDisplay for MacDisplay {
             last_cursor: None,
             coord_mapper: self.coord_mapper.clone(),
             _display_awake: display_awake,
+            audio_tx,
+            fallback: None,
+            paused_since: None,
+            last_fallback_frame: None,
+            last_capture_event: Instant::now(),
+            last_capture_restart: Instant::now(),
+            _virtual_display: virtual_display,
         }))
     }
 }
@@ -245,6 +342,19 @@ struct MacDisplayUpdates {
     coord_mapper: MouseCoordMapper,
     /// Keeps the display on for as long as this session's updates are alive
     _display_awake: Option<DisplayAwake>,
+    /// Audio sender, so a restarted capturer keeps the session's audio
+    audio_tx: Option<tokio::sync::mpsc::Sender<macrdp_capture::AudioFrame>>,
+    /// CoreGraphics capture, used while ScreenCaptureKit is paused (lock screen)
+    fallback: Option<CgFallbackCapturer>,
+    /// When ScreenCaptureKit started reporting paused, if it currently is
+    paused_since: Option<Instant>,
+    last_fallback_frame: Option<Instant>,
+    /// Last time ScreenCaptureKit delivered anything (frame, idle or paused)
+    last_capture_event: Instant,
+    last_capture_restart: Instant,
+    /// This session's client-sized display; removed when the session ends.
+    /// Declared last so it outlives the capturer that's recording it.
+    _virtual_display: Option<VirtualDisplay>,
 }
 
 #[async_trait::async_trait]
@@ -292,13 +402,52 @@ impl MacDisplayUpdates {
     /// Waits for the next capture event. With cursor sync on, gives up after
     /// CURSOR_POLL and returns None so the caller can check the cursor.
     async fn next_capture_event(&mut self) -> Option<Option<macrdp_capture::CaptureEvent>> {
-        if !self.cursor_sync {
-            return Some(self.capturer.next_frame().await);
-        }
         tokio::select! {
             event = self.capturer.next_frame() => Some(event),
-            _ = tokio::time::sleep(CURSOR_POLL) => None,
+            _ = tokio::time::sleep(POLL_INTERVAL) => None,
         }
+    }
+
+    /// On a poll tick: a CoreGraphics frame while capture is paused (so the
+    /// lock screen shows instead of a frozen picture), or a capture restart if
+    /// ScreenCaptureKit has gone silent while the client is active.
+    async fn handle_tick(&mut self) -> Result<Option<DisplayUpdate>> {
+        if let Some(since) = self.paused_since {
+            let due = self.last_fallback_frame.map_or(true, |t| t.elapsed() >= self.capture_frame_interval());
+            if since.elapsed() >= PAUSED_FALLBACK_AFTER && due {
+                self.last_fallback_frame = Some(Instant::now());
+                let fallback = self.fallback.get_or_insert_with(|| CgFallbackCapturer::new(&self.capture_config));
+                if let Some(frame) = fallback.capture_frame() {
+                    return self.encode_and_send(frame);
+                }
+            }
+            return Ok(None);
+        }
+
+        let client_active = macrdp_input::power::last_user_activity()
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(6));
+        if client_active
+            && self.last_capture_event.elapsed() >= STALL_TIMEOUT
+            && self.last_capture_restart.elapsed() >= STALL_RESTART_INTERVAL
+        {
+            self.last_capture_restart = Instant::now();
+            tracing::warn!(
+                silent_secs = self.last_capture_event.elapsed().as_secs(),
+                "Screen capture went silent while the client is active — restarting it"
+            );
+            match ScreenCapturer::new(self.capture_config.clone(), self.audio_tx.clone()).await {
+                Ok(capturer) => {
+                    self.capturer = capturer;
+                    self.last_capture_event = Instant::now();
+                }
+                Err(e) => tracing::warn!("Couldn't restart screen capture: {e}"),
+            }
+        }
+        Ok(None)
+    }
+
+    fn capture_frame_interval(&self) -> Duration {
+        Duration::from_millis(1000 / self.capture_config.frame_rate.clamp(1, 30) as u64)
     }
 
     async fn next_frame_update(&mut self) -> Result<Option<DisplayUpdate>> {
@@ -307,15 +456,27 @@ impl MacDisplayUpdates {
         // which works at the display level (including lock screen).
         let frame = loop {
             let event = match self.next_capture_event().await {
-                None => return Ok(Some(DisplayUpdate::DefaultPointer)), // cursor poll tick
-                Some(Some(e)) => e,
+                None => {
+                    if let Some(update) = self.handle_tick().await? {
+                        return Ok(Some(update));
+                    }
+                    if self.cursor_sync {
+                        // Lets next_update check the cursor shape
+                        return Ok(Some(DisplayUpdate::DefaultPointer));
+                    }
+                    continue;
+                }
+                Some(Some(e)) => {
+                    self.last_capture_event = Instant::now();
+                    e
+                }
                 Some(None) => {
                     // SCK stopped — fall back to CoreGraphics capture (works on lock screen)
                     tracing::warn!("SCStream stopped — switching to CoreGraphics fallback (lock screen?)");
                     let fallback = CgFallbackCapturer::new(&self.capture_config);
                     loop {
                         // Try to restore SCK (faster, has dirty rects)
-                        match ScreenCapturer::new(self.capture_config.clone(), None).await {
+                        match ScreenCapturer::new(self.capture_config.clone(), self.audio_tx.clone()).await {
                             Ok(new_capturer) => {
                                 tracing::info!("SCStream recovered — switching back from CoreGraphics");
                                 self.capturer = new_capturer;
@@ -336,14 +497,26 @@ impl MacDisplayUpdates {
             };
             // Handle CaptureEvent — extract frame or skip idle
             let frame = match event {
-                macrdp_capture::CaptureEvent::Frame(f) => f,
+                macrdp_capture::CaptureEvent::Frame(f) => {
+                    if self.paused_since.take().is_some() {
+                        tracing::info!("Screen capture resumed");
+                    }
+                    f
+                }
                 macrdp_capture::CaptureEvent::Idle => continue,
+                macrdp_capture::CaptureEvent::Paused => {
+                    if self.paused_since.is_none() {
+                        tracing::warn!("Screen capture paused (screen locked?) — showing it via CoreGraphics");
+                        self.paused_since = Some(Instant::now());
+                    }
+                    continue;
+                }
             };
             // If another frame is already buffered, skip this one and grab the newer one
             // This prevents frame queuing which adds latency
             match self.capturer.try_next_frame() {
                 Some(macrdp_capture::CaptureEvent::Frame(_newer)) => continue,
-                Some(macrdp_capture::CaptureEvent::Idle) => break frame,
+                Some(macrdp_capture::CaptureEvent::Idle | macrdp_capture::CaptureEvent::Paused) => break frame,
                 None => break frame,
             }
         };
@@ -740,5 +913,19 @@ mod tests {
 
         let updates = frame_to_bitmap_updates(&frame, 64);
         assert_eq!(updates.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod virtual_size_tests {
+    use super::fit_virtual_size;
+
+    #[test]
+    fn fits_client_sizes() {
+        assert_eq!(fit_virtual_size(2560, 1440), (2560, 1440));
+        assert_eq!(fit_virtual_size(3236, 1345), (3236, 1344)); // even height
+        assert_eq!(fit_virtual_size(640, 480), (800, 600)); // minimum
+        assert_eq!(fit_virtual_size(5120, 1440), (4096, 1152)); // ultrawide shrinks, keeps aspect
+        assert_eq!(fit_virtual_size(7680, 4320), (4096, 2304));
     }
 }

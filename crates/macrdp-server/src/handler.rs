@@ -41,6 +41,20 @@ impl MouseCoordMapper {
         (mac_x, mac_y)
     }
 
+    /// macOS logical size of the display being controlled
+    pub fn logical_size(&self) -> (u16, u16) {
+        let s = self.0.lock().unwrap();
+        (s.logical_w as u16, s.logical_h as u16)
+    }
+
+    /// Points the mapper at a display of this logical size (e.g. the virtual display)
+    pub fn set_logical_size(&self, logical_w: u16, logical_h: u16) {
+        let mut s = self.0.lock().unwrap();
+        s.logical_w = logical_w.max(1) as f64;
+        s.logical_h = logical_h.max(1) as f64;
+        tracing::info!(logical_w, logical_h, "MouseCoordMapper logical size updated");
+    }
+
     /// RDP desktop pixels per macOS point (for sizing the mirrored cursor)
     pub fn rdp_pixels_per_point(&self) -> f64 {
         let s = self.0.lock().unwrap();

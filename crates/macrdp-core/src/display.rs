@@ -177,6 +177,7 @@ impl RdpServerDisplay for MacDisplay {
                 CapturePixelFormat::Bgra
             },
             show_cursor: self.show_cursor,
+            display_id: None,
         };
         // Read the current audio sender from the shared slot (set by AudioFactory per connection)
         let audio_tx = self.shared_audio_tx.as_ref()
@@ -390,7 +391,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
                     self.idle_frame_count = 0;
                     f
                 }
-                macrdp_capture::CaptureEvent::Idle => {
+                macrdp_capture::CaptureEvent::Idle | macrdp_capture::CaptureEvent::Paused => {
                     self.idle_frame_count += 1;
                     continue;
                 }
@@ -400,7 +401,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
             // This prevents frame queuing which adds latency
             match self.capturer.try_next_frame() {
                 Some(macrdp_capture::CaptureEvent::Frame(_newer)) => continue, // drop older, grab newer
-                Some(macrdp_capture::CaptureEvent::Idle) => break frame, // idle after frame — use this frame
+                Some(macrdp_capture::CaptureEvent::Idle | macrdp_capture::CaptureEvent::Paused) => break frame, // idle after frame — use this frame
                 None => break frame,
             }
         };
