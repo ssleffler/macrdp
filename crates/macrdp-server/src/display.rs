@@ -9,6 +9,7 @@ use macrdp_audio::SharedAudioTx;
 use macrdp_capture::cursor::{self, CursorImage};
 use macrdp_capture::{CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, ScreenCapturer};
 use macrdp_encode::{self, Quality, VideoEncoder};
+use macrdp_input::power::DisplayAwake;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 
@@ -177,6 +178,10 @@ impl RdpServerDisplay for MacDisplay {
             },
             show_cursor: self.show_cursor,
         };
+        // Wake the display before capturing: while it's off macOS draws nothing,
+        // so the client would get a black screen. Held until the client leaves.
+        let display_awake = DisplayAwake::new();
+
         // Read the current audio sender from the shared slot (set by AudioFactory per connection)
         let audio_tx = self.shared_audio_tx.as_ref()
             .and_then(|shared| shared.lock().unwrap().clone());
@@ -213,6 +218,7 @@ impl RdpServerDisplay for MacDisplay {
             cursor_seed: None,
             last_cursor: None,
             coord_mapper: self.coord_mapper.clone(),
+            _display_awake: display_awake,
         }))
     }
 }
@@ -237,6 +243,8 @@ struct MacDisplayUpdates {
     /// Last cursor shape sent to the client
     last_cursor: Option<CursorImage>,
     coord_mapper: MouseCoordMapper,
+    /// Keeps the display on for as long as this session's updates are alive
+    _display_awake: Option<DisplayAwake>,
 }
 
 #[async_trait::async_trait]

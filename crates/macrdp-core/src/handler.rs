@@ -108,6 +108,8 @@ impl MacInputHandler {
 
 impl RdpServerInputHandler for MacInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
+        // Remote input should count as someone at the Mac (screen saver, display sleep)
+        macrdp_input::power::declare_user_activity();
         let Some(kb) = &self.keyboard else { return };
 
         let result = match event {
@@ -127,6 +129,7 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
+        macrdp_input::power::declare_user_activity();
         let Some(m) = &self.mouse else { return };
 
         let result = match event {
