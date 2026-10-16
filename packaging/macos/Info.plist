@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.macrdp.server</string>
+	<key>CFBundleName</key>
+	<string>macrdp</string>
+	<key>CFBundleDisplayName</key>
+	<string>macrdp</string>
+	<key>CFBundleExecutable</key>
+	<string>macrdp-server</string>
+	<key>CFBundleIconFile</key>
+	<string>macrdp</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<!-- Background server: no Dock icon or menu bar -->
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>GPL-3.0</string>
+</dict>
+</plist>

@@ -15,8 +15,12 @@ for plist in /Users/*/Library/LaunchAgents/com.macrdp.server.plist; do
     echo "Removed login agent for $owner"
 done
 
+rm -rf /Applications/macrdp.app
 rm -f /usr/local/bin/macrdp-server
 rm -rf /usr/local/share/macrdp
+# Drop macrdp's Screen Recording / Accessibility entries
+tccutil reset ScreenCapture com.macrdp.server >/dev/null 2>&1 || true
+tccutil reset Accessibility com.macrdp.server >/dev/null 2>&1 || true
 pkgutil --forget com.macrdp.server >/dev/null 2>&1 || true
 echo "macrdp removed. Config and logs in each user's home folder were kept."
 rm -f /usr/local/bin/macrdp-uninstall

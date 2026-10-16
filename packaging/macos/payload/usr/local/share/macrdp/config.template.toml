@@ -28,6 +28,14 @@ width = 0
 # Set to a specific value (e.g. 1080) to force a fixed resolution
 height = 0
 
+# Match the client's window size
+# Default: true
+# Each RDP session gets its own virtual display at the size the client asks
+# for (1:1 pixels, 800x600 up to 4096x2304), replacing the Mac's display until
+# the client disconnects. Needs width/height = 0 and resolution "auto".
+# false = keep the Mac's display and scale it to the client instead.
+# match_client_resolution = true
+
 # Target frame rate
 # Default: 60
 # Options: 30, 60, 120

@@ -36,4 +36,3 @@ macrdp-ui/dist/
 # macOS installer build output
 packaging/macos/build/
 packaging/macos/dist/
-packaging/macos/payload/usr/local/bin/macrdp-server

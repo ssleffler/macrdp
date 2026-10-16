@@ -6,7 +6,7 @@ set -euo pipefail
 
 USER_NAME="${1:?usage: setup-user.sh <username>}"
 LABEL="com.macrdp.server"
-BIN="/usr/local/bin/macrdp-server"
+BIN="/Applications/macrdp.app/Contents/MacOS/macrdp-server"
 SHARE="/usr/local/share/macrdp"
 
 USER_ID=$(id -u "$USER_NAME")
