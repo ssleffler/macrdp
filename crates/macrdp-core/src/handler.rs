@@ -118,7 +118,9 @@ impl RdpServerInputHandler for MacInputHandler {
             KeyboardEvent::UnicodePressed(ch) => kb.inject_unicode(ch, true),
             KeyboardEvent::UnicodeReleased(ch) => kb.inject_unicode(ch, false),
             KeyboardEvent::Synchronize(_flags) => {
-                tracing::debug!("Keyboard synchronize event (ignored)");
+                // Sent when the client window gains focus: start from a clean slate
+                tracing::debug!("Keyboard synchronize: releasing held keys");
+                kb.release_all();
                 Ok(())
             }
         };
