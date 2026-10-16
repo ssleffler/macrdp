@@ -3,6 +3,7 @@
 pub mod keyboard;
 pub mod keymap;
 pub mod mouse;
+pub mod power;
 
 pub use keyboard::KeyboardInjector;
 pub use keymap::scancode_to_keycode;

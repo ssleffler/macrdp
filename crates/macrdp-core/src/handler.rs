@@ -108,6 +108,8 @@ impl MacInputHandler {
 
 impl RdpServerInputHandler for MacInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
+        // Remote input should count as someone at the Mac (screen saver, display sleep)
+        macrdp_input::power::declare_user_activity();
         let Some(kb) = &self.keyboard else { return };
 
         let result = match event {
@@ -116,7 +118,9 @@ impl RdpServerInputHandler for MacInputHandler {
             KeyboardEvent::UnicodePressed(ch) => kb.inject_unicode(ch, true),
             KeyboardEvent::UnicodeReleased(ch) => kb.inject_unicode(ch, false),
             KeyboardEvent::Synchronize(_flags) => {
-                tracing::debug!("Keyboard synchronize event (ignored)");
+                // Sent when the client window gains focus: start from a clean slate
+                tracing::debug!("Keyboard synchronize: releasing held keys");
+                kb.release_all();
                 Ok(())
             }
         };
@@ -127,6 +131,7 @@ impl RdpServerInputHandler for MacInputHandler {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
+        macrdp_input::power::declare_user_activity();
         let Some(m) = &self.mouse else { return };
 
         let result = match event {
