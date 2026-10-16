@@ -41,6 +41,12 @@ impl MouseCoordMapper {
         (mac_x, mac_y)
     }
 
+    /// RDP desktop pixels per macOS point (for sizing the mirrored cursor)
+    pub fn rdp_pixels_per_point(&self) -> f64 {
+        let s = self.0.lock().unwrap();
+        s.rdp_w / s.logical_w.max(1.0)
+    }
+
     pub fn update_rdp_size(&self, rdp_w: u16, rdp_h: u16) {
         let mut s = self.0.lock().unwrap();
         let old_w = s.rdp_w;
@@ -63,7 +69,16 @@ pub struct MacInputHandler {
     last_mouse_x: u16,
     last_mouse_y: u16,
     coord_mapper: MouseCoordMapper,
+    /// Wheel units received but not yet turned into whole lines
+    wheel_remainder: i32,
+    /// Buttons currently held: left, right, middle
+    buttons_down: [bool; 3],
 }
+
+/// RDP wheel units per mouse-wheel notch (Windows WHEEL_DELTA)
+const WHEEL_DELTA: i32 = 120;
+/// Lines scrolled per notch (Windows default)
+const LINES_PER_NOTCH: i32 = 3;
 
 impl MacInputHandler {
     pub fn new(coord_mapper: MouseCoordMapper) -> Self {
@@ -86,7 +101,17 @@ impl MacInputHandler {
             last_mouse_x: 0,
             last_mouse_y: 0,
             coord_mapper,
+            wheel_remainder: 0,
+            buttons_down: [false; 3],
         }
+    }
+
+    /// The button a drag belongs to, if any is held (left wins over right over middle).
+    fn held_button(&self) -> Option<MouseButton> {
+        [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
+            .into_iter()
+            .zip(self.buttons_down)
+            .find_map(|(button, down)| down.then_some(button))
     }
 }
 
@@ -118,27 +143,45 @@ impl RdpServerInputHandler for MacInputHandler {
                 let (mx, my) = self.coord_mapper.map(x, y);
                 self.last_mouse_x = mx;
                 self.last_mouse_y = my;
-                m.move_to(mx, my)
+                m.move_to(mx, my, self.held_button())
             }
             MouseEvent::LeftPressed => {
+                self.buttons_down[0] = true;
                 m.button_event(MouseButton::Left, true, self.last_mouse_x, self.last_mouse_y)
             }
             MouseEvent::LeftReleased => {
+                self.buttons_down[0] = false;
                 m.button_event(MouseButton::Left, false, self.last_mouse_x, self.last_mouse_y)
             }
             MouseEvent::RightPressed => {
+                self.buttons_down[1] = true;
                 m.button_event(MouseButton::Right, true, self.last_mouse_x, self.last_mouse_y)
             }
             MouseEvent::RightReleased => {
+                self.buttons_down[1] = false;
                 m.button_event(MouseButton::Right, false, self.last_mouse_x, self.last_mouse_y)
             }
             MouseEvent::MiddlePressed => {
+                self.buttons_down[2] = true;
                 m.button_event(MouseButton::Middle, true, self.last_mouse_x, self.last_mouse_y)
             }
             MouseEvent::MiddleReleased => {
+                self.buttons_down[2] = false;
                 m.button_event(MouseButton::Middle, false, self.last_mouse_x, self.last_mouse_y)
             }
-            MouseEvent::VerticalScroll { value } => m.scroll(value),
+            MouseEvent::VerticalScroll { value } => {
+                // RDP sends wheel units (120 per notch); macOS expects lines.
+                // Keep the remainder so high-resolution wheels and touchpads,
+                // which send small deltas, still add up to whole lines.
+                let units = self.wheel_remainder + value as i32 * LINES_PER_NOTCH;
+                let lines = units / WHEEL_DELTA;
+                self.wheel_remainder = units % WHEEL_DELTA;
+                if lines != 0 {
+                    m.scroll(lines as i16)
+                } else {
+                    Ok(())
+                }
+            }
             _ => {
                 tracing::trace!(?event, "Unhandled mouse event");
                 Ok(())

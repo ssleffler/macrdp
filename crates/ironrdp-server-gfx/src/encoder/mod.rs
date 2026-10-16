@@ -151,6 +151,10 @@ impl UpdateEncoder {
 
     fn rgba_pointer(ptr: RGBAPointer) -> Result<UpdateFragmenter> {
         let xor_mask = ptr.data;
+        // Clients such as mstsc expect an AND mask even for 32bpp pointers.
+        // All zeros: every pixel comes from the XOR (BGRA) data and its alpha.
+        let and_stride = (usize::from(ptr.width) + 15) / 16 * 2;
+        let and_mask = vec![0u8; and_stride * usize::from(ptr.height)];
 
         let hot_spot = Point16 {
             x: ptr.hot_x,
@@ -162,7 +166,7 @@ impl UpdateEncoder {
             width: ptr.width,
             height: ptr.height,
             xor_mask: &xor_mask,
-            and_mask: &[],
+            and_mask: &and_mask,
         };
         let ptr = PointerAttribute {
             xor_bpp: 32,

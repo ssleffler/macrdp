@@ -1,0 +1,7 @@
+#!/bin/bash
+# Stop a running macrdp-server for the logged-in user so the binary can be replaced.
+CONSOLE_USER=$(stat -f%Su /dev/console)
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+    launchctl bootout "gui/$(id -u "$CONSOLE_USER")/com.macrdp.server" 2>/dev/null || true
+fi
+exit 0

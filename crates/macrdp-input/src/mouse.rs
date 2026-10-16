@@ -32,19 +32,22 @@ impl MouseInjector {
             .map_err(|_| anyhow::anyhow!("Failed to create CGEventSource"))
     }
 
-    pub fn move_to(&self, x: u16, y: u16) -> Result<()> {
+    /// Moves the pointer. Pass the held button (if any) so macOS gets a drag
+    /// event; plain MouseMoved while a button is down doesn't move windows live.
+    pub fn move_to(&self, x: u16, y: u16, held: Option<MouseButton>) -> Result<()> {
         let point = CGPoint::new(x as f64, y as f64);
+        let (event_type, cg_button) = match held {
+            None => (CGEventType::MouseMoved, CGMouseButton::Left),
+            Some(MouseButton::Left) => (CGEventType::LeftMouseDragged, CGMouseButton::Left),
+            Some(MouseButton::Right) => (CGEventType::RightMouseDragged, CGMouseButton::Right),
+            Some(MouseButton::Middle) => (CGEventType::OtherMouseDragged, CGMouseButton::Center),
+        };
         let source = Self::source()?;
-        let event = CGEvent::new_mouse_event(
-            source,
-            CGEventType::MouseMoved,
-            point,
-            CGMouseButton::Left,
-        )
-        .map_err(|_| anyhow::anyhow!("Failed to create mouse move event"))?;
+        let event = CGEvent::new_mouse_event(source, event_type, point, cg_button)
+            .map_err(|_| anyhow::anyhow!("Failed to create mouse move event"))?;
 
         event.post(CGEventTapLocation::HID);
-        tracing::trace!(x, y, "Mouse moved");
+        tracing::trace!(x, y, ?held, "Mouse moved");
         Ok(())
     }
 
@@ -89,7 +92,7 @@ impl MouseInjector {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseButton {
     Left,
     Right,

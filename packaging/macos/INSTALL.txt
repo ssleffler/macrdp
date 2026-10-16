@@ -1,0 +1,99 @@
+macrdp 0.1.0 — RDP server for macOS
+=====================================
+
+Lets you connect to this Mac from Windows Remote Desktop (mstsc), the Windows
+App, Microsoft Remote Desktop or FreeRDP.
+
+Requires macOS 14 (Sonoma) or later. Works on Apple Silicon and Intel Macs.
+No developer tools needed.
+
+This build includes:
+  - Mac cursor shapes on the client (link hand, text beam, busy, resize…)
+  - Windows-style scrolling (3 lines per wheel notch)
+  - Windows follow the pointer while you drag them
+
+
+INSTALL
+-------
+1. Copy macrdp-0.1.0.pkg to the Mac and double-click it.
+   (Build it with packaging/macos/build-pkg.sh; it lands in packaging/macos/dist/.)
+
+   The package isn't signed by an Apple developer, so macOS blocks it the
+   first time. To allow it:
+     System Settings > Privacy & Security > scroll down > "Open Anyway"
+   Or in Terminal, from the folder with the file:
+     sudo installer -pkg macrdp-0.1.0.pkg -target /
+
+2. Install it while logged in as the user people will connect to.
+   At the end a window shows the RDP username and a new random password.
+   Copy the password somewhere safe. (It's also in the config file below.)
+
+3. Grant two permissions. Without them you get a black screen and/or
+   no keyboard and mouse control.
+
+   System Settings > Privacy & Security:
+     - Screen & System Audio Recording
+     - Accessibility
+   In each: click +, press Cmd+Shift+G, paste /usr/local/bin/macrdp-server,
+   add it and make sure its switch is ON.
+
+   macOS may also show its own prompts for these. An Accessibility prompt
+   only adds macrdp-server to the list; you still have to switch it on.
+
+4. Restart macrdp so it picks up the permissions:
+     launchctl kickstart -k gui/$(id -u)/com.macrdp.server
+   (or log out and back in). It now starts on every login.
+
+5. Check it worked:
+     grep -E "Screen Recording|Accessibility" ~/Library/Logs/macrdp/macrdp.log | tail -2
+   Both lines should say [OK].
+
+
+CONNECT
+-------
+From your RDP client, connect to  <this-mac's-IP>:3389
+Find the IP in System Settings > Wi-Fi (or Network) > Details.
+Use the username and password from step 2.
+
+
+IF THE PERMISSIONS DON'T TAKE
+-----------------------------
+If the log still shows [!!] for Accessibility even though the switch is on,
+macOS is holding a stale entry. Clear it and grant it again:
+  tccutil reset Accessibility com.macrdp.server
+  (remove any leftover macrdp-server entries with the – button)
+  launchctl kickstart -k gui/$(id -u)/com.macrdp.server
+Then switch macrdp-server on when it reappears, and restart once more.
+Screen Recording works the same way:  tccutil reset ScreenCapture com.macrdp.server
+
+After installing an UPDATE of macrdp, you have to do this again: macOS treats
+each new build as a new program.
+
+
+SETTINGS
+--------
+~/.config/macrdp/config.toml   (username, password, port, cursor, quality…)
+After editing, restart it:
+  launchctl kickstart -k gui/$(id -u)/com.macrdp.server
+
+To use less bandwidth, add for example:
+  bitrate_mbps = 20
+  frame_rate = 30
+
+Logs: ~/Library/Logs/macrdp/
+
+
+START AFTER A POWER CUT
+-----------------------
+macrdp runs only after someone logs in. To have the Mac come back on its own:
+  - System Settings > Users & Groups > Automatically log in as: <user>
+    (not available when FileVault is on)
+  - sudo pmset -a autorestart 1   (power on after a power failure)
+
+
+UNINSTALL
+---------
+  sudo macrdp-uninstall
+Your config and logs are kept in your home folder.
+
+Reinstalling or upgrading keeps your existing config and password.
