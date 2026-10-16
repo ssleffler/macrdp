@@ -15,6 +15,16 @@ use std::sync::{Arc, Mutex};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Started by ourselves to own one session's virtual display (see virtual_display.rs)
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(macrdp_capture::virtual_display::HELPER_ARG) {
+        macrdp_capture::virtual_display::run_helper(&args[2..]);
+    }
+    // Started by ourselves to read the current Accessibility state (see below)
+    if args.get(1).map(String::as_str) == Some(CHECK_ACCESSIBILITY_ARG) {
+        std::process::exit(if macrdp_input::check_accessibility_permission() { 0 } else { 1 });
+    }
+
     let cli = Cli::parse();
     let config = ServerConfig::load(&cli)?;
 
@@ -23,18 +33,23 @@ async fn main() -> Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
 
+    // Append, so a restart (or crash) keeps the history; rotate at 10 MB
     let log_path = std::env::current_dir().unwrap_or_default().join("macrdp.log");
-    let log_file = std::fs::File::create(&log_path)?;
+    if std::fs::metadata(&log_path).is_ok_and(|m| m.len() > 10 * 1024 * 1024) {
+        let _ = std::fs::rename(&log_path, log_path.with_extension("log.1"));
+    }
+    let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
 
+    use std::io::IsTerminal;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
+    // Under launchd stderr goes to an ever-growing file; the log file is enough there
+    let stderr_layer = std::io::stderr().is_terminal().then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
+
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stderr)
-        )
+        .with(stderr_layer)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
@@ -44,7 +59,11 @@ async fn main() -> Result<()> {
 
     eprintln!("Log file: {}", log_path.display());
 
-    tracing::info!(?config, "macrdp server starting");
+    let mut shown_config = config.clone();
+    if shown_config.password.is_some() {
+        shown_config.password = Some("<hidden>".into());
+    }
+    tracing::info!(config = ?shown_config, "macrdp server starting");
 
     // Ensure TLS certificates exist
     let (cert_path, key_path) =
@@ -59,6 +78,7 @@ async fn main() -> Result<()> {
 
     // Check and request required macOS permissions
     check_permissions();
+    restart_when_accessibility_granted();
 
     // Detect macOS display sizes:
     // - SCK logical: from ScreenCaptureKit SCDisplay, used for capture sizing
@@ -201,7 +221,8 @@ async fn main() -> Result<()> {
 
     // Create display with shared GFX state
     let show_cursor = config.show_cursor.unwrap_or(true);
-    let display = MacDisplay::new(width, height, fixed_resolution, config.frame_rate, quality, encoder_pref, mode_444, show_cursor, bitrate_override, Arc::clone(&gfx_state), coord_mapper, shared_audio_tx, perf_stats.clone());
+    let display = MacDisplay::new(width, height, fixed_resolution, config.frame_rate, quality, encoder_pref, mode_444, show_cursor, bitrate_override, Arc::clone(&gfx_state), coord_mapper, shared_audio_tx, perf_stats.clone())
+        .match_client_resolution(config.match_client_resolution.unwrap_or(true));
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.port).parse()?;
 
@@ -269,6 +290,39 @@ async fn main() -> Result<()> {
     }
 
     result
+}
+
+/// Asks a fresh copy of this executable for the Accessibility state
+const CHECK_ACCESSIBILITY_ARG: &str = "--check-accessibility";
+
+/// macOS only applies Accessibility to a process started after it was granted,
+/// so once the user allows it (e.g. from the prompt shown at install), restart
+/// in place: same PID and arguments, so launchd doesn't notice.
+///
+/// AXIsProcessTrusted() caches its answer for the life of the process, so the
+/// grant is detected by asking a short-lived child process instead.
+fn restart_when_accessibility_granted() {
+    if macrdp_input::check_accessibility_permission() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let granted = std::process::Command::new(&exe)
+            .arg(CHECK_ACCESSIBILITY_ARG)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if granted {
+            tracing::info!("Accessibility granted — restarting to apply it");
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(&exe).args(std::env::args().skip(1)).exec();
+            tracing::error!("Restart after Accessibility grant failed: {err}");
+            return;
+        }
+    });
 }
 
 /// Check and request all required macOS permissions at startup.

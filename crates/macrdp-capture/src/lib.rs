@@ -1,6 +1,7 @@
 //! macOS screen capture via ScreenCaptureKit
 
 pub mod cursor;
+pub mod virtual_display;
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -76,6 +77,9 @@ pub enum CaptureEvent {
     Frame(CapturedFrame),
     /// Desktop is unchanged — no new pixel data.
     Idle,
+    /// macOS isn't giving ScreenCaptureKit any pixels (blank, suspended or
+    /// stopped), e.g. while the screen is locked. The last frame is stale.
+    Paused,
 }
 
 /// A captured screen frame
@@ -111,6 +115,8 @@ pub struct CaptureConfig {
     pub frame_rate: u32,
     pub pixel_format: CapturePixelFormat,
     pub show_cursor: bool,
+    /// Display to capture (CGDirectDisplayID); None = the first display
+    pub display_id: Option<u32>,
 }
 
 /// Screen capturer using ScreenCaptureKit
@@ -229,7 +235,8 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
     use screencapturekit::cm::SCFrameStatus;
 
     // Idle means desktop is unchanged — propagate as CaptureEvent::Idle.
-    // Blank/Suspended/Stopped are non-displayable states — discard silently.
+    // Blank/Suspended/Stopped mean no pixels (e.g. screen locked) — report it,
+    // so the caller can switch to a capture method that still works.
     match sample.frame_status() {
         Some(SCFrameStatus::Idle) => {
             return Some(CaptureEvent::Idle);
@@ -237,7 +244,7 @@ fn extract_frame(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
         Some(SCFrameStatus::Blank)
         | Some(SCFrameStatus::Suspended)
         | Some(SCFrameStatus::Stopped) => {
-            return None;
+            return Some(CaptureEvent::Paused);
         }
         _ => {}
     }
@@ -295,7 +302,8 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
     use screencapturekit::cm::SCFrameStatus;
 
     // Idle means desktop is unchanged — propagate as CaptureEvent::Idle.
-    // Blank/Suspended/Stopped are non-displayable states — discard silently.
+    // Blank/Suspended/Stopped mean no pixels (e.g. screen locked) — report it,
+    // so the caller can switch to a capture method that still works.
     match sample.frame_status() {
         Some(SCFrameStatus::Idle) => {
             return Some(CaptureEvent::Idle);
@@ -303,7 +311,7 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
         Some(SCFrameStatus::Blank)
         | Some(SCFrameStatus::Suspended)
         | Some(SCFrameStatus::Stopped) => {
-            return None;
+            return Some(CaptureEvent::Paused);
         }
         _ => {}
     }
@@ -394,6 +402,31 @@ pub fn detect_cg_display_size() -> Result<(u32, u32)> {
 }
 
 impl ScreenCapturer {
+    /// The display to capture. A just-created display can take a moment to
+    /// show up in ScreenCaptureKit, so a specific ID is retried for ~2 s.
+    async fn find_display(display_id: Option<u32>) -> Result<SCDisplay> {
+        let mut attempts = 0;
+        loop {
+            // SCShareableContent::get() is synchronous, run in blocking task
+            let content = tokio::task::spawn_blocking(|| SCShareableContent::get())
+                .await?
+                .context("Failed to get shareable content (Screen Recording permission needed)")?;
+            let displays = content.displays();
+            let found = match display_id {
+                Some(id) => displays.into_iter().find(|d| d.display_id() == id),
+                None => displays.into_iter().next(),
+            };
+            match found {
+                Some(display) => return Ok(display),
+                None if display_id.is_some() && attempts < 20 => {
+                    attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                None => anyhow::bail!("Display {display_id:?} not found"),
+            }
+        }
+    }
+
     /// Create a new screen capturer for the main display.
     ///
     /// If `audio_tx` is `Some`, audio capture is enabled and frames are sent
@@ -402,16 +435,7 @@ impl ScreenCapturer {
         config: CaptureConfig,
         audio_tx: Option<mpsc::Sender<AudioFrame>>,
     ) -> Result<Self> {
-        // SCShareableContent::get() is synchronous, run in blocking task
-        let content = tokio::task::spawn_blocking(|| SCShareableContent::get())
-            .await?
-            .context("Failed to get shareable content (Screen Recording permission needed)")?;
-
-        let display = content
-            .displays()
-            .into_iter()
-            .next()
-            .context("No display found")?;
+        let display = Self::find_display(config.display_id).await?;
 
         let actual_width = if config.width == 0 {
             display.width() as u32
@@ -522,9 +546,11 @@ pub struct CgFallbackCapturer {
 }
 
 impl CgFallbackCapturer {
-    /// Create a fallback capturer for the main display
+    /// Create a fallback capturer for the configured display (default: main)
     pub fn new(config: &CaptureConfig) -> Self {
-        let display_id = core_graphics::display::CGDisplay::main().id;
+        let display_id = config
+            .display_id
+            .unwrap_or_else(|| core_graphics::display::CGDisplay::main().id);
         let fps = if config.frame_rate > 0 { config.frame_rate } else { 30 };
         Self {
             display_id,
