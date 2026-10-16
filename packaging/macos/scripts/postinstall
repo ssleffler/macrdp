@@ -1,0 +1,37 @@
+#!/bin/bash
+# Set up macrdp-server for the logged-in user and tell them what to do next.
+CONSOLE_USER=$(stat -f%Su /dev/console)
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
+    echo "macrdp: no user logged in; run /usr/local/share/macrdp/setup-user.sh <username> later."
+    exit 0
+fi
+
+/usr/local/share/macrdp/setup-user.sh "$CONSOLE_USER" || exit 1
+
+USER_ID=$(id -u "$CONSOLE_USER")
+PW_FILE="/var/tmp/macrdp-newpw.$USER_ID"
+NEW_PASSWORD=$(cat "$PW_FILE" 2>/dev/null)
+rm -f "$PW_FILE"
+
+if [ -n "$NEW_PASSWORD" ]; then
+    LOGIN_TEXT="RDP login\\n   Username: $CONSOLE_USER\\n   Password: (shown below, select to copy)\\n\\nChange it any time in ~/.config/macrdp/config.toml"
+else
+    LOGIN_TEXT="Your existing settings in ~/.config/macrdp/config.toml were kept."
+fi
+
+MSG="macrdp is installed and starts automatically when you log in.\\n\\n$LOGIN_TEXT\\n\\nOne more step: in System Settings > Privacy & Security, add /usr/local/bin/macrdp-server under BOTH Screen & System Audio Recording AND Accessibility, then log out and back in."
+
+# Show the dialog in the background so the installer never waits on it.
+(
+    if [ -n "$NEW_PASSWORD" ]; then
+        launchctl asuser "$USER_ID" sudo -u "$CONSOLE_USER" osascript \
+            -e "display dialog \"$MSG\" default answer \"$NEW_PASSWORD\" with title \"macrdp\" buttons {\"Open Privacy Settings\", \"OK\"} default button \"OK\" giving up after 1800" \
+            -e 'if button returned of result is "Open Privacy Settings" then do shell script "open \"x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture\""'
+    else
+        launchctl asuser "$USER_ID" sudo -u "$CONSOLE_USER" osascript \
+            -e "display dialog \"$MSG\" with title \"macrdp\" buttons {\"Open Privacy Settings\", \"OK\"} default button \"OK\" giving up after 1800" \
+            -e 'if button returned of result is "Open Privacy Settings" then do shell script "open \"x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture\""'
+    fi
+) >/dev/null 2>&1 &
+
+exit 0
