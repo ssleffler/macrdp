@@ -310,6 +310,7 @@ impl RdpServerDisplay for MacDisplay {
             coord_mapper: self.coord_mapper.clone(),
             _display_awake: display_awake,
             audio_tx,
+            deferred_frame: None,
             fallback: None,
             paused_since: None,
             last_fallback_frame: None,
@@ -344,6 +345,8 @@ struct MacDisplayUpdates {
     _display_awake: Option<DisplayAwake>,
     /// Audio sender, so a restarted capturer keeps the session's audio
     audio_tx: Option<tokio::sync::mpsc::Sender<macrdp_capture::AudioFrame>>,
+    /// Frame held back by encode overload protection, sent on the next tick
+    deferred_frame: Option<CapturedFrame>,
     /// CoreGraphics capture, used while ScreenCaptureKit is paused (lock screen)
     fallback: Option<CgFallbackCapturer>,
     /// When ScreenCaptureKit started reporting paused, if it currently is
@@ -412,6 +415,11 @@ impl MacDisplayUpdates {
     /// lock screen shows instead of a frozen picture), or a capture restart if
     /// ScreenCaptureKit has gone silent while the client is active.
     async fn handle_tick(&mut self) -> Result<Option<DisplayUpdate>> {
+        if self.paused_since.is_none() {
+            if let Some(frame) = self.deferred_frame.take() {
+                return self.encode_and_send(frame);
+            }
+        }
         if let Some(since) = self.paused_since {
             let due = self.last_fallback_frame.map_or(true, |t| t.elapsed() >= self.capture_frame_interval());
             if since.elapsed() >= PAUSED_FALLBACK_AFTER && due {
@@ -501,6 +509,8 @@ impl MacDisplayUpdates {
                     if self.paused_since.take().is_some() {
                         tracing::info!("Screen capture resumed");
                     }
+                    // A newer frame supersedes one held back by overload protection
+                    self.deferred_frame = None;
                     f
                 }
                 macrdp_capture::CaptureEvent::Idle => continue,
@@ -525,9 +535,13 @@ impl MacDisplayUpdates {
     }
 
     fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
-        // Encode overload protection: skip this frame if previous encode took too long
+        // Encode overload protection: if the previous encode took too long, hold
+        // this frame back instead of encoding it now. It's sent on the next poll
+        // tick unless a newer frame replaces it first. (Dropping it outright left
+        // the client stale after the last change of a burst, e.g. typing.)
         if self.skip_next_frame {
             self.skip_next_frame = false;
+            self.deferred_frame = Some(frame);
             return Ok(Some(DisplayUpdate::DefaultPointer));
         }
 
