@@ -3,9 +3,10 @@ use bytes::Bytes;
 use ironrdp_server::{
     BitmapUpdate, DesktopSize, DisplayUpdate, GfxFrameUpdate, GfxUncompressedUpdate,
     PixelFormat as RdpPixelFormat, RdpServerDisplay, RdpServerDisplayUpdates,
-    UncompressedRect, gfx::GfxState,
+    RGBAPointer, UncompressedRect, gfx::GfxState,
 };
 use macrdp_audio::SharedAudioTx;
+use macrdp_capture::cursor::{self, CursorImage};
 use macrdp_capture::{CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, ScreenCapturer};
 use macrdp_encode::{self, Quality, VideoEncoder};
 use std::num::{NonZeroU16, NonZeroUsize};
@@ -21,6 +22,9 @@ const TILE_SIZE: u16 = 64;
 /// Below this threshold, raw pixels are sent instead of H.264 encoding.
 /// 65536 pixels ≈ 256×256 rect ≈ 256 KB of raw BGRA data.
 const UNCOMPRESSED_MAX_PIXELS: u32 = 65536;
+
+/// How often to check whether the Mac's cursor shape changed
+const CURSOR_POLL: std::time::Duration = std::time::Duration::from_millis(33);
 
 /// Convert a captured frame into tiled BitmapUpdate chunks
 pub fn frame_to_bitmap_updates(frame: &CapturedFrame, tile_size: u16) -> Vec<BitmapUpdate> {
@@ -204,6 +208,11 @@ impl RdpServerDisplay for MacDisplay {
             skip_next_frame: false,
             overload_count: 0,
             perf_stats: self.perf_stats.clone(),
+            // The cursor isn't in the video, so mirror its shape to the client instead.
+            cursor_sync: !self.show_cursor,
+            cursor_seed: None,
+            last_cursor: None,
+            coord_mapper: self.coord_mapper.clone(),
         }))
     }
 }
@@ -221,18 +230,78 @@ struct MacDisplayUpdates {
     overload_count: u64,
     /// Shared performance statistics collector (None = disabled)
     perf_stats: Option<SharedPerfStats>,
+    /// Send the Mac's cursor shape to the client (when it isn't drawn into the video)
+    cursor_sync: bool,
+    /// Cursor change counter at the last check
+    cursor_seed: Option<i32>,
+    /// Last cursor shape sent to the client
+    last_cursor: Option<CursorImage>,
+    coord_mapper: MouseCoordMapper,
 }
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for MacDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+        if !self.cursor_sync {
+            return self.next_frame_update().await;
+        }
+        loop {
+            if let Some(pointer) = self.changed_cursor() {
+                return Ok(Some(DisplayUpdate::RGBAPointer(pointer)));
+            }
+            match self.next_frame_update().await {
+                // DefaultPointer doubles as "nothing to send" (skipped frame). Sending it
+                // would reset the client to its default arrow, so skip it instead.
+                Ok(Some(DisplayUpdate::DefaultPointer)) => continue,
+                other => return other,
+            }
+        }
+    }
+}
+
+impl MacDisplayUpdates {
+    /// The Mac's cursor as an RDP pointer, if its shape changed since the last call.
+    fn changed_cursor(&mut self) -> Option<RGBAPointer> {
+        let seed = cursor::cursor_seed();
+        if self.cursor_seed == Some(seed) {
+            return None;
+        }
+        self.cursor_seed = Some(seed);
+        let image = cursor::current_cursor(self.coord_mapper.rdp_pixels_per_point())?;
+        if self.last_cursor.as_ref() == Some(&image) {
+            return None;
+        }
+        self.last_cursor = Some(image.clone());
+        Some(RGBAPointer {
+            width: image.width,
+            height: image.height,
+            hot_x: image.hot_x,
+            hot_y: image.hot_y,
+            data: image.bgra_bottom_up,
+        })
+    }
+
+    /// Waits for the next capture event. With cursor sync on, gives up after
+    /// CURSOR_POLL and returns None so the caller can check the cursor.
+    async fn next_capture_event(&mut self) -> Option<Option<macrdp_capture::CaptureEvent>> {
+        if !self.cursor_sync {
+            return Some(self.capturer.next_frame().await);
+        }
+        tokio::select! {
+            event = self.capturer.next_frame() => Some(event),
+            _ = tokio::time::sleep(CURSOR_POLL) => None,
+        }
+    }
+
+    async fn next_frame_update(&mut self) -> Result<Option<DisplayUpdate>> {
         // Drain stale frames — always use the latest available frame.
         // If SCK capturer stops (e.g. screen locked), fall back to CGDisplayCreateImage
         // which works at the display level (including lock screen).
         let frame = loop {
-            let event = match self.capturer.next_frame().await {
-                Some(e) => e,
-                None => {
+            let event = match self.next_capture_event().await {
+                None => return Ok(Some(DisplayUpdate::DefaultPointer)), // cursor poll tick
+                Some(Some(e)) => e,
+                Some(None) => {
                     // SCK stopped — fall back to CoreGraphics capture (works on lock screen)
                     tracing::warn!("SCStream stopped — switching to CoreGraphics fallback (lock screen?)");
                     let fallback = CgFallbackCapturer::new(&self.capture_config);
@@ -273,9 +342,7 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
 
         self.encode_and_send(frame)
     }
-}
 
-impl MacDisplayUpdates {
     fn encode_and_send(&mut self, frame: CapturedFrame) -> Result<Option<DisplayUpdate>> {
         // Encode overload protection: skip this frame if previous encode took too long
         if self.skip_next_frame {
