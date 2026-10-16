@@ -8,7 +8,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$(cd "$HERE/../.." && pwd)"
-VERSION="0.2.1"
+VERSION="0.2.2"
 OUT="$HERE/dist/macrdp-$VERSION.pkg"
 BUILD="$HERE/build"
 ROOT="$BUILD/root"

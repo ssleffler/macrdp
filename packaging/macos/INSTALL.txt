@@ -1,4 +1,4 @@
-macrdp 0.2.1 — RDP server for macOS
+macrdp 0.2.2 — RDP server for macOS
 =====================================
 
 Lets you connect to this Mac from Windows Remote Desktop (mstsc), the Windows
@@ -17,14 +17,14 @@ This build includes:
 
 INSTALL
 -------
-1. Copy macrdp-0.2.1.pkg to the Mac and double-click it.
+1. Copy macrdp-0.2.2.pkg to the Mac and double-click it.
    (Build it with packaging/macos/build-pkg.sh; it lands in packaging/macos/dist/.)
 
    The package isn't signed by an Apple developer, so macOS blocks it the
    first time. To allow it:
      System Settings > Privacy & Security > scroll down > "Open Anyway"
    Or in Terminal, from the folder with the file:
-     sudo installer -pkg macrdp-0.2.1.pkg -target /
+     sudo installer -pkg macrdp-0.2.2.pkg -target /
 
 2. Install it while logged in as the user people will connect to. It installs
    /Applications/macrdp.app (a background app, no Dock icon) and starts it.
