@@ -6,7 +6,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$(cd "$HERE/../.." && pwd)"
-VERSION="0.1.0"
+VERSION="0.1.1"
 OUT="$HERE/dist/macrdp-$VERSION.pkg"
 BUILD="$HERE/build"
 BIN="$HERE/payload/usr/local/bin/macrdp-server"
