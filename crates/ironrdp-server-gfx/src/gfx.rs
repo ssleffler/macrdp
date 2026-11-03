@@ -10,7 +10,7 @@ use ironrdp_pdu::rdp::vc::dvc::gfx::{
     CapabilitiesV103Flags, CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitiesV81Flags,
     CapabilitySet, ClientPdu, Codec1Type, CreateSurfacePdu, EndFramePdu, Encoding,
     MapSurfaceToOutputPdu, PixelFormat as GfxPixelFormat, QuantQuality, ResetGraphicsPdu,
-    ServerPdu, StartFramePdu, Timestamp, WireToSurface1Pdu,
+    QueueDepth, ServerPdu, StartFramePdu, Timestamp, WireToSurface1Pdu,
 };
 use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_pdu::{decode, PduResult};
@@ -151,6 +151,9 @@ pub struct GfxState {
     pub height: u16,
     /// Frames sent but not yet acknowledged
     pub pending_acks: u32,
+    /// The client told us (QueueDepth::Suspend) or showed us (no acks for
+    /// seconds) that it won't acknowledge frames: flow control is off.
+    pub acks_suspended: bool,
     /// Last acknowledged frame ID
     pub last_ack_frame: u32,
     /// Network quality estimate (0.0 = congested, 1.0 = excellent)
@@ -200,6 +203,7 @@ impl GfxState {
             width,
             height,
             pending_acks: 0,
+            acks_suspended: false,
             last_ack_frame: 0,
             network_quality: 1.0,
             frame_send_times: std::collections::HashMap::new(),
@@ -237,7 +241,9 @@ impl GfxState {
             if mbps < self.bitrate_min { self.bitrate_min = mbps; }
         }
         self.last_frame_time = Some(std::time::Instant::now());
-        self.frame_send_times.insert(self.frame_id, std::time::Instant::now());
+        if !self.acks_suspended {
+            self.frame_send_times.insert(self.frame_id, std::time::Instant::now());
+        }
         // Limit map size to prevent unbounded growth
         if self.frame_send_times.len() > 120 {
             let cutoff = self.frame_id.saturating_sub(120);
@@ -246,12 +252,49 @@ impl GfxState {
         self.frame_id
     }
 
+    /// Frames sent that the client hasn't acknowledged yet. Counted by frame
+    /// ID, so a client that acknowledges only some frames can't drift it.
+    pub fn frames_in_flight(&self) -> u32 {
+        if self.acks_suspended {
+            0
+        } else {
+            self.frame_id.saturating_sub(self.last_ack_frame)
+        }
+    }
+
+    /// Whether the next frame should wait: the client is more than
+    /// `max_in_flight` frames behind and is still acknowledging. A client that
+    /// hasn't acknowledged its oldest outstanding frame within `stall_timeout`
+    /// is treated as not acknowledging at all, so it can't freeze the stream.
+    pub fn client_is_behind(&mut self, max_in_flight: u32, stall_timeout: std::time::Duration) -> bool {
+        if self.acks_suspended || self.frames_in_flight() <= max_in_flight {
+            return false;
+        }
+        let oldest_unacked = self.frame_send_times.values().min().copied();
+        match oldest_unacked {
+            Some(sent) if sent.elapsed() > stall_timeout => {
+                tracing::warn!(
+                    in_flight = self.frames_in_flight(),
+                    "Client stopped acknowledging frames — sending without flow control"
+                );
+                self.suspend_acks();
+                false
+            }
+            _ => true,
+        }
+    }
+
+    pub fn suspend_acks(&mut self) {
+        self.acks_suspended = true;
+        self.frame_send_times.clear();
+    }
+
     /// Update network quality and RTT based on frame acknowledgment
     pub fn ack_frame(&mut self, ack_frame_id: u32) {
-        self.last_ack_frame = ack_frame_id;
-        if self.pending_acks > 0 {
-            self.pending_acks -= 1;
-        }
+        self.last_ack_frame = self.last_ack_frame.max(ack_frame_id);
+        // Everything up to the acked frame is done, even if it wasn't acked itself
+        self.frame_send_times.retain(|&id, _| id > ack_frame_id);
+        self.pending_acks = self.frames_in_flight();
 
         // Calculate RTT from send timestamp
         if let Some(send_time) = self.frame_send_times.remove(&ack_frame_id) {
@@ -701,6 +744,10 @@ impl DvcProcessor for GfxHandler {
 
             ClientPdu::FrameAcknowledge(ack) => {
                 let mut state = self.state.lock().unwrap();
+                if ack.queue_depth == QueueDepth::Suspend && !state.acks_suspended {
+                    info!("Client suspended frame acknowledgements — flow control off");
+                    state.suspend_acks();
+                }
                 state.ack_frame(ack.frame_id);
 
                 // Log stats every 60 acked frames (~1 second at 60fps)
@@ -730,7 +777,7 @@ impl DvcProcessor for GfxHandler {
                         inst_min,
                         inst_std,
                         state.last_frame_bytes / 1024,
-                        state.pending_acks,
+                        state.frames_in_flight(),
                     );
 
                     // Reset for next window
@@ -756,3 +803,50 @@ impl DvcProcessor for GfxHandler {
 }
 
 impl DvcServerProcessor for GfxHandler {}
+
+#[cfg(test)]
+mod flow_control_tests {
+    use super::GfxState;
+    use std::time::Duration;
+
+    const PATIENT: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn holds_frames_while_client_is_behind() {
+        let mut s = GfxState::new(1920, 1080, false);
+        for _ in 0..4 {
+            s.next_frame_id();
+        }
+        assert_eq!(s.frames_in_flight(), 4);
+        assert!(s.client_is_behind(3, PATIENT));
+        s.ack_frame(2);
+        assert_eq!(s.frames_in_flight(), 2);
+        assert!(!s.client_is_behind(3, PATIENT));
+    }
+
+    #[test]
+    fn sparse_acks_do_not_drift() {
+        let mut s = GfxState::new(1920, 1080, false);
+        for _ in 0..10 {
+            s.next_frame_id();
+        }
+        s.ack_frame(10); // acked the latest only
+        assert_eq!(s.frames_in_flight(), 0);
+        assert!(s.frame_send_times.is_empty());
+        s.ack_frame(4); // a late, out-of-order ack can't move it backwards
+        assert_eq!(s.frames_in_flight(), 0);
+    }
+
+    #[test]
+    fn stalled_client_turns_flow_control_off() {
+        let mut s = GfxState::new(1920, 1080, false);
+        for _ in 0..5 {
+            s.next_frame_id();
+        }
+        assert!(!s.client_is_behind(3, Duration::ZERO), "stalled client must not block");
+        assert!(s.acks_suspended);
+        assert_eq!(s.frames_in_flight(), 0);
+        s.next_frame_id();
+        assert!(s.frame_send_times.is_empty(), "no send-time tracking once suspended");
+    }
+}

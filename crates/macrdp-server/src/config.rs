@@ -100,6 +100,10 @@ pub struct ServerConfig {
     /// (default: true). Needs resolution "auto" and no fixed width/height;
     /// false scales the Mac's own display instead.
     pub match_client_resolution: Option<bool>,
+    /// Frames a client may leave unacknowledged before new frames are held
+    /// back (default: 3). Keeps slow clients a few frames behind instead of
+    /// seconds; raise it a little if a client stutters, lower it for latency.
+    pub max_frames_in_flight: Option<u32>,
     /// Target bitrate in Mbps (default: auto-calculated from resolution/fps/quality)
     /// Override this to force a specific bitrate, e.g. 50 for 50 Mbps.
     pub bitrate_mbps: Option<u32>,
@@ -137,6 +141,7 @@ impl Default for ServerConfig {
             resolution: None,
             show_cursor: None,
             match_client_resolution: None,
+            max_frames_in_flight: None,
             bitrate_mbps: None,
             skip_unchanged: None,
             idle_keyframe_sec: None,

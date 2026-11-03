@@ -40,6 +40,15 @@ fn fit_virtual_size(width: u16, height: u16) -> (u16, u16) {
     (even(w * shrink, VIRTUAL_MIN.0), even(h * shrink, VIRTUAL_MIN.1))
 }
 
+/// Frames the client may leave unacknowledged before new ones are held back.
+/// A fast client acknowledges within a frame interval and never hits this;
+/// a slow one (software decoding) is kept a few frames behind instead of
+/// thousands, with stale frames dropped before they're encoded.
+pub const DEFAULT_MAX_FRAMES_IN_FLIGHT: u32 = 3;
+/// A client that hasn't acknowledged its oldest frame for this long is
+/// assumed not to acknowledge at all; flow control turns off for the session
+const ACK_STALL_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// How often the frame loop wakes up without a new frame (cursor shape checks,
 /// lock-screen fallback frames, stall detection)
 const POLL_INTERVAL: Duration = Duration::from_millis(33);
@@ -126,6 +135,7 @@ pub struct MacDisplay {
     gfx_state: Arc<Mutex<GfxState>>,
     /// Give each session its own display at the client's size (match_client_resolution)
     match_client: bool,
+    max_frames_in_flight: u32,
     /// Mouse mapper's logical size for the Mac's own display, used when no
     /// virtual display is active
     native_logical: (u16, u16),
@@ -162,6 +172,7 @@ impl MacDisplay {
             width, height,
             max_width: max_w, max_height: max_h,
             match_client: false,
+            max_frames_in_flight: DEFAULT_MAX_FRAMES_IN_FLIGHT,
             native_logical,
             coord_mapper,
             fixed_resolution,
@@ -169,6 +180,13 @@ impl MacDisplay {
             shared_audio_tx,
             perf_stats,
         }
+    }
+
+    /// How far a client may fall behind before frames are held back (see
+    /// DEFAULT_MAX_FRAMES_IN_FLIGHT).
+    pub fn max_frames_in_flight(mut self, frames: u32) -> Self {
+        self.max_frames_in_flight = frames.max(1);
+        self
     }
 
     /// Create a display at each client's requested size (needs resolution "auto").
@@ -310,6 +328,9 @@ impl RdpServerDisplay for MacDisplay {
             coord_mapper: self.coord_mapper.clone(),
             _display_awake: display_awake,
             audio_tx,
+            max_frames_in_flight: self.max_frames_in_flight,
+            needs_full_frame: false,
+            held_back_count: 0,
             deferred_frame: None,
             fallback: None,
             paused_since: None,
@@ -345,7 +366,14 @@ struct MacDisplayUpdates {
     _display_awake: Option<DisplayAwake>,
     /// Audio sender, so a restarted capturer keeps the session's audio
     audio_tx: Option<tokio::sync::mpsc::Sender<macrdp_capture::AudioFrame>>,
-    /// Frame held back by encode overload protection, sent on the next tick
+    max_frames_in_flight: u32,
+    /// A held-back frame may have carried small dirty-rect updates that are now
+    /// lost, so the next frame actually sent must be a full one
+    needs_full_frame: bool,
+    /// Frames held back because the client was behind (for rate-limited logging)
+    held_back_count: u64,
+    /// Latest frame held back (encode overload, or client behind); sent on a
+    /// later tick unless a newer frame replaces it first
     deferred_frame: Option<CapturedFrame>,
     /// CoreGraphics capture, used while ScreenCaptureKit is paused (lock screen)
     fallback: Option<CgFallbackCapturer>,
@@ -363,18 +391,16 @@ struct MacDisplayUpdates {
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for MacDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
-        if !self.cursor_sync {
-            return self.next_frame_update().await;
-        }
+        // Never returns Ok(None): to ironrdp that means the display is gone.
+        // Internally, Ok(None) from next_frame_update means "nothing to send yet".
         loop {
-            if let Some(pointer) = self.changed_cursor() {
-                return Ok(Some(DisplayUpdate::RGBAPointer(pointer)));
+            if self.cursor_sync {
+                if let Some(pointer) = self.changed_cursor() {
+                    return Ok(Some(DisplayUpdate::RGBAPointer(pointer)));
+                }
             }
-            match self.next_frame_update().await {
-                // DefaultPointer doubles as "nothing to send" (skipped frame). Sending it
-                // would reset the client to its default arrow, so skip it instead.
-                Ok(Some(DisplayUpdate::DefaultPointer)) => continue,
-                other => return other,
+            if let Some(update) = self.next_frame_update().await? {
+                return Ok(Some(update));
             }
         }
     }
@@ -454,6 +480,31 @@ impl MacDisplayUpdates {
         Ok(None)
     }
 
+    /// The client has more than max_frames_in_flight frames it hasn't acknowledged
+    fn client_is_behind(&mut self) -> bool {
+        let mut state = self.gfx_state.lock().unwrap();
+        let behind = state.client_is_behind(self.max_frames_in_flight, ACK_STALL_TIMEOUT);
+        if behind {
+            self.held_back_count += 1;
+            if self.held_back_count % 600 == 1 {
+                tracing::info!(
+                    in_flight = state.frames_in_flight(),
+                    held_back_total = self.held_back_count,
+                    "Client is behind — holding frames back"
+                );
+            }
+        }
+        behind
+    }
+
+    /// Keep `frame` to send on a later tick (a newer frame replaces it). The
+    /// frames skipped this way may have held dirty-rect-only updates, so the
+    /// next frame actually sent must be a full one.
+    fn hold_back(&mut self, frame: CapturedFrame) {
+        self.deferred_frame = Some(frame);
+        self.needs_full_frame = true;
+    }
+
     fn capture_frame_interval(&self) -> Duration {
         Duration::from_millis(1000 / self.capture_config.frame_rate.clamp(1, 30) as u64)
     }
@@ -464,16 +515,7 @@ impl MacDisplayUpdates {
         // which works at the display level (including lock screen).
         let frame = loop {
             let event = match self.next_capture_event().await {
-                None => {
-                    if let Some(update) = self.handle_tick().await? {
-                        return Ok(Some(update));
-                    }
-                    if self.cursor_sync {
-                        // Lets next_update check the cursor shape
-                        return Ok(Some(DisplayUpdate::DefaultPointer));
-                    }
-                    continue;
-                }
+                None => return self.handle_tick().await,
                 Some(Some(e)) => {
                     self.last_capture_event = Instant::now();
                     e
@@ -541,8 +583,8 @@ impl MacDisplayUpdates {
         // the client stale after the last change of a burst, e.g. typing.)
         if self.skip_next_frame {
             self.skip_next_frame = false;
-            self.deferred_frame = Some(frame);
-            return Ok(Some(DisplayUpdate::DefaultPointer));
+            self.hold_back(frame);
+            return Ok(None);
         }
 
         // Check GFX state and AVC444 negotiation
@@ -555,9 +597,17 @@ impl MacDisplayUpdates {
             (ready, use_444)
         };
 
+        // Flow control: don't pile frames onto a client that hasn't acknowledged
+        // the previous ones (it would decode them all, seconds behind). Keep the
+        // newest frame and send it once the client has caught up.
+        if gfx_ready && self.client_is_behind() {
+            self.hold_back(frame);
+            return Ok(None);
+        }
+
         if gfx_ready {
             // GFX uncompressed path — for small dirty regions, skip H.264 encoding entirely
-            if !frame.dirty_rects.is_empty() {
+            if !frame.dirty_rects.is_empty() && !self.needs_full_frame {
                 let total_area: u32 = frame.dirty_rects.iter()
                     .map(|r| r.width * r.height)
                     .sum();
@@ -663,6 +713,7 @@ impl MacDisplayUpdates {
                                         );
                                     }
                                 }
+                                self.needs_full_frame = false;
                                 return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                     h264_data: encoded.data,
                                     width: frame.width as u16,
@@ -675,11 +726,11 @@ impl MacDisplayUpdates {
                             }
                             Ok(_) => {
                                 tracing::warn!("Zero-copy encode returned empty data");
-                                return Ok(Some(DisplayUpdate::DefaultPointer));
+                                return Ok(None);
                             }
                             Err(e) => {
                                 tracing::warn!("Zero-copy encode failed: {e}, falling back to DefaultPointer");
-                                return Ok(Some(DisplayUpdate::DefaultPointer));
+                                return Ok(None);
                             }
                         }
                     }
@@ -725,7 +776,8 @@ impl MacDisplayUpdates {
                                     );
                                 }
                             }
-                            return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
+                            self.needs_full_frame = false;
+                                return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                 h264_data: encoded.main_view.data,
                                 width: frame.width as u16,
                                 height: frame.height as u16,
@@ -740,7 +792,7 @@ impl MacDisplayUpdates {
                                 display_frame = self.display_frame_count,
                                 "AVC444 encode returned EMPTY data — frame dropped!"
                             );
-                            return Ok(Some(DisplayUpdate::DefaultPointer));
+                            return Ok(None);
                         }
                         Err(e) => {
                             tracing::warn!(display_frame = self.display_frame_count, "AVC444 encode failed: {e}, falling back to AVC420");
@@ -782,7 +834,8 @@ impl MacDisplayUpdates {
                                 );
                             }
                         }
-                        return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
+                        self.needs_full_frame = false;
+                                return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                             h264_data: encoded.data,
                             width: frame.width as u16,
                             height: frame.height as u16,
@@ -797,7 +850,7 @@ impl MacDisplayUpdates {
                             display_frame = self.display_frame_count,
                             "H.264 encode returned EMPTY data — frame dropped!"
                         );
-                        return Ok(Some(DisplayUpdate::DefaultPointer));
+                        return Ok(None);
                     }
                     Err(e) => {
                         tracing::warn!(display_frame = self.display_frame_count, "H.264 encode failed: {e}");
@@ -807,7 +860,7 @@ impl MacDisplayUpdates {
         } else if self.encoder.is_some() {
             // H.264 encoder exists — never send bitmaps, wait for GFX to become ready.
             // Mixing bitmap and GFX causes 0xd06 DECOMPRESSION_FAILED on reconnect.
-            return Ok(Some(DisplayUpdate::DefaultPointer));
+            return Ok(None);
         }
 
         // Bitmap path (only when GFX is not available at all)
@@ -816,7 +869,7 @@ impl MacDisplayUpdates {
             FrameData::Raw(bytes) => bytes,
             FrameData::PixelBuffer(_) => {
                 tracing::warn!("PixelBuffer frame in bitmap path — should not happen");
-                return Ok(Some(DisplayUpdate::DefaultPointer));
+                return Ok(None);
             }
         };
 

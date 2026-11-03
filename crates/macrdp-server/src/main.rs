@@ -222,7 +222,8 @@ async fn main() -> Result<()> {
     // Create display with shared GFX state
     let show_cursor = config.show_cursor.unwrap_or(true);
     let display = MacDisplay::new(width, height, fixed_resolution, config.frame_rate, quality, encoder_pref, mode_444, show_cursor, bitrate_override, Arc::clone(&gfx_state), coord_mapper, shared_audio_tx, perf_stats.clone())
-        .match_client_resolution(config.match_client_resolution.unwrap_or(true));
+        .match_client_resolution(config.match_client_resolution.unwrap_or(true))
+        .max_frames_in_flight(config.max_frames_in_flight.unwrap_or(display::DEFAULT_MAX_FRAMES_IN_FLIGHT));
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.port).parse()?;
 
