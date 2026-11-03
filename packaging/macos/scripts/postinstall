@@ -1,44 +1,58 @@
 #!/bin/bash
-# Set up macrdp for the logged-in user, start it so macOS asks for its two
-# permissions right away, and tell the user what to do.
-CONSOLE_USER=$(stat -f%Su /dev/console)
-if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
-    echo "macrdp: no user logged in; run /usr/local/share/macrdp/setup-user.sh <username> later."
-    exit 0
-fi
+# Set up macrdp for the installing user (and everyone who already had it),
+# start it so macOS asks for its two permissions right away, and say so.
 
 # A new build is a new program to macOS, so earlier grants no longer match.
 # Clear them so macOS asks again now, instead of failing silently later.
 tccutil reset ScreenCapture com.macrdp.server >/dev/null 2>&1 || true
 tccutil reset Accessibility com.macrdp.server >/dev/null 2>&1 || true
 
-# Writes the config/agent and starts macrdp, which shows the permission prompts
-/usr/local/share/macrdp/setup-user.sh "$CONSOLE_USER" || exit 1
-
-USER_ID=$(id -u "$CONSOLE_USER")
-PW_FILE="/var/tmp/macrdp-newpw.$USER_ID"
-NEW_PASSWORD=$(cat "$PW_FILE" 2>/dev/null)
-rm -f "$PW_FILE"
-
-if [ -n "$NEW_PASSWORD" ]; then
-    LOGIN_TEXT="RDP login\\n   Username: $CONSOLE_USER\\n   Password: (shown below, select to copy)\\n\\nChange it any time in ~/.config/macrdp/config.toml"
-else
-    LOGIN_TEXT="Your existing settings in ~/.config/macrdp/config.toml were kept."
+# Who to set up: the user at the console, the user running the installer
+# (the console shows "root" while the Mac is reached only remotely), and
+# anyone who already has macrdp set up.
+candidates="$(stat -f%Su /dev/console) ${SUDO_USER:-} ${USER:-}"
+for plist in /Users/*/Library/LaunchAgents/com.macrdp.server.plist; do
+    [ -f "$plist" ] && candidates="$candidates $(stat -f%Su "$plist")"
+done
+users=$(for u in $candidates; do
+    [ -n "$u" ] && [ "$u" != root ] && id -u "$u" >/dev/null 2>&1 && echo "$u"
+done | sort -u)
+if [ -z "$users" ]; then
+    echo "macrdp: no user to set up; run /usr/local/share/macrdp/setup-user.sh <username> later."
+    exit 0
 fi
 
-MSG="macrdp is installed and starts automatically when you log in.\\n\\n$LOGIN_TEXT\\n\\nmacOS is asking for two permissions for macrdp. Allow both:\\n  • Screen & System Audio Recording\\n  • Accessibility (keyboard and mouse control)\\nIn System Settings switch macrdp on. macrdp restarts by itself once Accessibility is on."
+for u in $users; do
+    # Writes the config/agent and (re)starts macrdp, which shows the permission prompts
+    /usr/local/share/macrdp/setup-user.sh "$u" || exit 1
+    uid=$(id -u "$u")
+    pw_file="/var/tmp/macrdp-newpw.$uid"
+    new_password=$(cat "$pw_file" 2>/dev/null)
+    rm -f "$pw_file"
 
-# Show the dialog in the background so the installer never waits on it.
-(
-    if [ -n "$NEW_PASSWORD" ]; then
-        launchctl asuser "$USER_ID" sudo -u "$CONSOLE_USER" osascript \
-            -e "display dialog \"$MSG\" default answer \"$NEW_PASSWORD\" with title \"macrdp\" buttons {\"Open Accessibility Settings\", \"OK\"} default button \"OK\" giving up after 1800" \
-            -e 'if button returned of result is "Open Accessibility Settings" then do shell script "open \"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility\""'
+    # No GUI session for this user: nothing to show
+    launchctl print "gui/$uid" >/dev/null 2>&1 || continue
+
+    if [ -n "$new_password" ]; then
+        login_text="RDP login\\n   Username: $u\\n   Password: (shown below, select to copy)\\n\\nChange it any time in ~/.config/macrdp/config.toml"
     else
-        launchctl asuser "$USER_ID" sudo -u "$CONSOLE_USER" osascript \
-            -e "display dialog \"$MSG\" with title \"macrdp\" buttons {\"Open Accessibility Settings\", \"OK\"} default button \"OK\" giving up after 1800" \
-            -e 'if button returned of result is "Open Accessibility Settings" then do shell script "open \"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility\""'
+        login_text="Your existing settings in ~/.config/macrdp/config.toml were kept."
     fi
-) >/dev/null 2>&1 &
+    msg="macrdp is installed and starts automatically when you log in.\\n\\n$login_text\\n\\nmacOS is asking for two permissions for macrdp. Allow both:\\n  • Screen & System Audio Recording\\n  • Accessibility (keyboard and mouse control)\\nIn System Settings switch macrdp on. macrdp restarts by itself once Accessibility is on."
+    open_settings='if button returned of result is "Open Accessibility Settings" then do shell script "open \"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility\""'
+
+    # Show the dialog in the background so the installer never waits on it.
+    (
+        if [ -n "$new_password" ]; then
+            launchctl asuser "$uid" sudo -u "$u" osascript \
+                -e "display dialog \"$msg\" default answer \"$new_password\" with title \"macrdp\" buttons {\"Open Accessibility Settings\", \"OK\"} default button \"OK\" giving up after 1800" \
+                -e "$open_settings"
+        else
+            launchctl asuser "$uid" sudo -u "$u" osascript \
+                -e "display dialog \"$msg\" with title \"macrdp\" buttons {\"Open Accessibility Settings\", \"OK\"} default button \"OK\" giving up after 1800" \
+                -e "$open_settings"
+        fi
+    ) >/dev/null 2>&1 &
+done
 
 exit 0

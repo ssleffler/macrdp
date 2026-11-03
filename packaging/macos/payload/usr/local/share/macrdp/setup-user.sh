@@ -69,7 +69,9 @@ chmod 644 "$PLIST"
 # Start it now if the user is logged in; otherwise it starts at their next login.
 if launchctl print "gui/$USER_ID" >/dev/null 2>&1; then
     launchctl bootout "gui/$USER_ID/$LABEL" 2>/dev/null || true
-    launchctl bootstrap "gui/$USER_ID" "$PLIST"
+    # If the old job is somehow still loaded, restart it in place instead
+    launchctl bootstrap "gui/$USER_ID" "$PLIST" 2>/dev/null \
+        || launchctl kickstart -k "gui/$USER_ID/$LABEL"
 fi
 
 if [ -n "$NEW_PASSWORD" ]; then

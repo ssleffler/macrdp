@@ -1,4 +1,4 @@
-macrdp 0.2.2 — RDP server for macOS
+macrdp 0.2.3 — RDP server for macOS
 =====================================
 
 Lets you connect to this Mac from Windows Remote Desktop (mstsc), the Windows
@@ -8,6 +8,7 @@ Requires macOS 14 (Sonoma) or later. Works on Apple Silicon and Intel Macs.
 No developer tools needed.
 
 This build includes:
+  - Flow control: slow clients (e.g. Remmina) stay a few frames behind, not seconds
   - The Mac's desktop matches your RDP window size, 1:1 (set when you connect)
   - The lock screen shows over RDP (no more frozen picture after the Mac locks)
   - Mac cursor shapes on the client (link hand, text beam, busy, resize…)
@@ -17,14 +18,14 @@ This build includes:
 
 INSTALL
 -------
-1. Copy macrdp-0.2.2.pkg to the Mac and double-click it.
+1. Copy macrdp-0.2.3.pkg to the Mac and double-click it.
    (Build it with packaging/macos/build-pkg.sh; it lands in packaging/macos/dist/.)
 
    The package isn't signed by an Apple developer, so macOS blocks it the
    first time. To allow it:
      System Settings > Privacy & Security > scroll down > "Open Anyway"
    Or in Terminal, from the folder with the file:
-     sudo installer -pkg macrdp-0.2.2.pkg -target /
+     sudo installer -pkg macrdp-0.2.3.pkg -target /
 
 2. Install it while logged in as the user people will connect to. It installs
    /Applications/macrdp.app (a background app, no Dock icon) and starts it.

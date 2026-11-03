@@ -36,6 +36,13 @@ height = 0
 # false = keep the Mac's display and scale it to the client instead.
 # match_client_resolution = true
 
+# Flow control: frames a client may leave unacknowledged before new frames
+# are held back (dropped before encoding, newest kept).
+# Default: 3. Keeps slow clients (software decoding, e.g. Remmina) a few
+# frames behind instead of seconds. Raise slightly if a client stutters,
+# lower for the least latency.
+# max_frames_in_flight = 3
+
 # Target frame rate
 # Default: 60
 # Options: 30, 60, 120
