@@ -1,4 +1,4 @@
-macrdp 0.2.3 — RDP server for macOS
+macrdp 0.2.5 — RDP server for macOS
 =====================================
 
 Lets you connect to this Mac from Windows Remote Desktop (mstsc), the Windows
@@ -8,6 +8,7 @@ Requires macOS 14 (Sonoma) or later. Works on Apple Silicon and Intel Macs.
 No developer tools needed.
 
 This build includes:
+  - Pointer and picture line up across the whole screen (no more drift to the right)
   - Flow control: slow clients (e.g. Remmina) stay a few frames behind, not seconds
   - The Mac's desktop matches your RDP window size, 1:1 (set when you connect)
   - The lock screen shows over RDP (no more frozen picture after the Mac locks)
@@ -18,14 +19,14 @@ This build includes:
 
 INSTALL
 -------
-1. Copy macrdp-0.2.3.pkg to the Mac and double-click it.
+1. Copy macrdp-0.2.5.pkg to the Mac and double-click it.
    (Build it with packaging/macos/build-pkg.sh; it lands in packaging/macos/dist/.)
 
    The package isn't signed by an Apple developer, so macOS blocks it the
    first time. To allow it:
      System Settings > Privacy & Security > scroll down > "Open Anyway"
    Or in Terminal, from the folder with the file:
-     sudo installer -pkg macrdp-0.2.3.pkg -target /
+     sudo installer -pkg macrdp-0.2.5.pkg -target /
 
 2. Install it while logged in as the user people will connect to. It installs
    /Applications/macrdp.app (a background app, no Dock icon) and starts it.
@@ -76,7 +77,7 @@ After editing, restart it:
   launchctl kickstart -k gui/$(id -u)/com.macrdp.server
 
 Desktop size: each connection gets a virtual display at your RDP window's size
-(800x600 up to 4096x2304). Resize the client window, then reconnect to change it.
+(800x608 up to 4096x2304, rounded down to multiples of 16). Resize the client window, then reconnect to change it.
 macOS may rearrange windows when you connect and disconnect.
 To keep the Mac's own display (scaled) instead, add:
   match_client_resolution = false
