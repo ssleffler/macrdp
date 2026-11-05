@@ -28,16 +28,20 @@ const UNCOMPRESSED_MAX_PIXELS: u32 = 65536;
 
 /// Size limits for the client-sized virtual display. The maximum is the
 /// largest frame VideoToolbox's H.264 encoder accepts.
-const VIRTUAL_MIN: (u32, u32) = (800, 600);
+const VIRTUAL_MIN: (u32, u32) = (800, 608);
 const VIRTUAL_MAX: (u32, u32) = (4096, 2304);
 
 /// Fits a client-requested size into the virtual display limits, keeping its
-/// aspect ratio, with even dimensions (required by the H.264 encoder).
+/// aspect ratio. Both sides are rounded down to a multiple of 16: the H.264
+/// encoder works in 16-pixel blocks, and any other size makes the encoded
+/// frame bigger than the desktop (e.g. 3248 for 3236), which the client then
+/// squeezes into the desktop. That drifts the picture against the pointer,
+/// more toward the right/bottom edge.
 fn fit_virtual_size(width: u16, height: u16) -> (u16, u16) {
     let (w, h) = (width.max(1) as f64, height.max(1) as f64);
     let shrink = (VIRTUAL_MAX.0 as f64 / w).min(VIRTUAL_MAX.1 as f64 / h).min(1.0);
-    let even = |v: f64, min: u32| ((v as u32).max(min) & !1) as u16;
-    (even(w * shrink, VIRTUAL_MIN.0), even(h * shrink, VIRTUAL_MIN.1))
+    let block = |v: f64, min: u32| ((v as u32).max(min) & !15) as u16;
+    (block(w * shrink, VIRTUAL_MIN.0), block(h * shrink, VIRTUAL_MIN.1))
 }
 
 /// Frames the client may leave unacknowledged before new ones are held back.
@@ -990,9 +994,15 @@ mod virtual_size_tests {
     #[test]
     fn fits_client_sizes() {
         assert_eq!(fit_virtual_size(2560, 1440), (2560, 1440));
-        assert_eq!(fit_virtual_size(3236, 1345), (3236, 1344)); // even height
-        assert_eq!(fit_virtual_size(640, 480), (800, 600)); // minimum
+        assert_eq!(fit_virtual_size(3236, 1345), (3232, 1344)); // 16-pixel blocks
+        assert_eq!(fit_virtual_size(3440, 1440), (3440, 1440));
+        assert_eq!(fit_virtual_size(1716, 1104), (1712, 1104));
+        assert_eq!(fit_virtual_size(640, 480), (800, 608)); // minimum
         assert_eq!(fit_virtual_size(5120, 1440), (4096, 1152)); // ultrawide shrinks, keeps aspect
         assert_eq!(fit_virtual_size(7680, 4320), (4096, 2304));
+        for (w, h) in [(1969, 1276), (3236, 1393), (1698, 1086), (1001, 777)] {
+            let (fw, fh) = fit_virtual_size(w, h);
+            assert_eq!((fw % 16, fh % 16), (0, 0), "{w}x{h} -> {fw}x{fh}");
+        }
     }
 }
