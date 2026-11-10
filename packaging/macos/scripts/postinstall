@@ -23,8 +23,13 @@ if [ -z "$users" ]; then
 fi
 
 for u in $users; do
-    # Writes the config/agent and (re)starts macrdp, which shows the permission prompts
-    /usr/local/share/macrdp/setup-user.sh "$u" || exit 1
+    # Writes the config/agent and (re)starts macrdp, which shows the permission prompts.
+    # A failure is logged (/var/log/install.log) but doesn't fail the install:
+    # the app is in place, and setup can be rerun.
+    if ! /usr/local/share/macrdp/setup-user.sh "$u"; then
+        echo "macrdp: setup for $u failed; rerun: sudo /usr/local/share/macrdp/setup-user.sh $u" >&2
+        continue
+    fi
     uid=$(id -u "$u")
     pw_file="/var/tmp/macrdp-newpw.$uid"
     new_password=$(cat "$pw_file" 2>/dev/null)

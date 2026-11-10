@@ -25,7 +25,13 @@ install -d -o "$USER_NAME" -g "$USER_GROUP" -m 755 "$AGENT_DIR"
 
 NEW_PASSWORD=""
 if [ ! -f "$CONFIG" ]; then
-    NEW_PASSWORD=$(LC_ALL=C tr -dc 'A-HJ-NP-Za-km-z2-9' </dev/urandom | head -c 16)
+    # Read a fixed amount first: `tr </dev/urandom | head` kills tr with SIGPIPE,
+    # which pipefail + set -e turned into a failed install on every fresh Mac
+    NEW_PASSWORD=$(head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-HJ-NP-Za-km-z2-9' | cut -c 1-16)
+    if [ ${#NEW_PASSWORD} -lt 16 ]; then
+        echo "macrdp: couldn't generate a password" >&2
+        exit 1
+    fi
     sed -e "s/__USERNAME__/$USER_NAME/" -e "s/__PASSWORD__/$NEW_PASSWORD/" \
         "$SHARE/config.template.toml" > "$CONFIG"
     chown "$USER_NAME:$USER_GROUP" "$CONFIG"
@@ -67,11 +73,14 @@ chown "$USER_NAME:$USER_GROUP" "$PLIST"
 chmod 644 "$PLIST"
 
 # Start it now if the user is logged in; otherwise it starts at their next login.
+# Never fatal: the agent is installed either way.
 if launchctl print "gui/$USER_ID" >/dev/null 2>&1; then
     launchctl bootout "gui/$USER_ID/$LABEL" 2>/dev/null || true
     # If the old job is somehow still loaded, restart it in place instead
-    launchctl bootstrap "gui/$USER_ID" "$PLIST" 2>/dev/null \
-        || launchctl kickstart -k "gui/$USER_ID/$LABEL"
+    if ! launchctl bootstrap "gui/$USER_ID" "$PLIST" 2>/dev/null \
+        && ! launchctl kickstart -k "gui/$USER_ID/$LABEL" 2>/dev/null; then
+        echo "macrdp: couldn't start it for $USER_NAME now; it starts at their next login" >&2
+    fi
 fi
 
 if [ -n "$NEW_PASSWORD" ]; then
