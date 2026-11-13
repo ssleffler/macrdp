@@ -53,6 +53,17 @@ pub const DEFAULT_MAX_FRAMES_IN_FLIGHT: u32 = 3;
 /// assumed not to acknowledge at all; flow control turns off for the session
 const ACK_STALL_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// The hardware encoder sometimes accepts frames and returns nothing at all:
+/// with low-latency rate control, Apple's H.264 encoder drops every frame when
+/// the bitrate target falls in a band around 110-120 Mbps at sizes up to about
+/// 1920x1200 (e.g. a 1920x1200 client got 111 Mbps -> black screen). After
+/// this many empty encodes in a row the encoder is recreated at a lower bitrate.
+const EMPTY_ENCODES_BEFORE_RESET: u32 = 5;
+/// Each reset multiplies the bitrate by this...
+const RESET_BITRATE_FACTOR: f64 = 0.75;
+/// ...but not below this
+const MIN_RESET_BITRATE: u32 = 8_000_000;
+
 /// How often the frame loop wakes up without a new frame (cursor shape checks,
 /// lock-screen fallback frames, stall detection)
 const POLL_INTERVAL: Duration = Duration::from_millis(33);
@@ -332,6 +343,9 @@ impl RdpServerDisplay for MacDisplay {
             coord_mapper: self.coord_mapper.clone(),
             _display_awake: display_awake,
             audio_tx,
+            quality: self.quality,
+            encoder_pref: self.encoder_pref,
+            empty_encodes: 0,
             max_frames_in_flight: self.max_frames_in_flight,
             needs_full_frame: false,
             held_back_count: 0,
@@ -370,6 +384,11 @@ struct MacDisplayUpdates {
     _display_awake: Option<DisplayAwake>,
     /// Audio sender, so a restarted capturer keeps the session's audio
     audio_tx: Option<tokio::sync::mpsc::Sender<macrdp_capture::AudioFrame>>,
+    /// Encoder settings, to recreate it if it stops producing output
+    quality: Quality,
+    encoder_pref: macrdp_encode::EncoderPreference,
+    /// Encodes in a row that returned no data
+    empty_encodes: u32,
     max_frames_in_flight: u32,
     /// A held-back frame may have carried small dirty-rect updates that are now
     /// lost, so the next frame actually sent must be a full one
@@ -482,6 +501,33 @@ impl MacDisplayUpdates {
             }
         }
         Ok(None)
+    }
+
+    /// Counts an encode that produced no data; after EMPTY_ENCODES_BEFORE_RESET
+    /// in a row, recreates the encoder at a lower bitrate.
+    fn note_empty_encode(&mut self) {
+        self.empty_encodes += 1;
+        if self.empty_encodes < EMPTY_ENCODES_BEFORE_RESET {
+            return;
+        }
+        self.empty_encodes = 0;
+        let bitrate = ((self.base_bitrate as f64 * RESET_BITRATE_FACTOR) as u32).max(MIN_RESET_BITRATE);
+        let (w, h) = (self.capture_config.width, self.capture_config.height);
+        tracing::warn!(
+            width = w, height = h,
+            old_mbps = self.base_bitrate as f64 / 1e6, new_mbps = bitrate as f64 / 1e6,
+            "Encoder produced no output — recreating it at a lower bitrate"
+        );
+        match macrdp_encode::create_encoder(
+            w, h, self.capture_config.frame_rate as f32, self.quality, self.encoder_pref, self.mode_444, bitrate,
+        ) {
+            Ok(encoder) => {
+                self.encoder = Some(encoder);
+                self.base_bitrate = bitrate;
+                self.needs_full_frame = true;
+            }
+            Err(e) => tracing::warn!("Couldn't recreate the encoder: {e}"),
+        }
     }
 
     /// The client has more than max_frames_in_flight frames it hasn't acknowledged
@@ -718,6 +764,7 @@ impl MacDisplayUpdates {
                                     }
                                 }
                                 self.needs_full_frame = false;
+                                self.empty_encodes = 0;
                                 return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                     h264_data: encoded.data,
                                     width: frame.width as u16,
@@ -730,6 +777,7 @@ impl MacDisplayUpdates {
                             }
                             Ok(_) => {
                                 tracing::warn!("Zero-copy encode returned empty data");
+                                self.note_empty_encode();
                                 return Ok(None);
                             }
                             Err(e) => {
@@ -781,6 +829,7 @@ impl MacDisplayUpdates {
                                 }
                             }
                             self.needs_full_frame = false;
+                                self.empty_encodes = 0;
                                 return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                                 h264_data: encoded.main_view.data,
                                 width: frame.width as u16,
@@ -796,7 +845,8 @@ impl MacDisplayUpdates {
                                 display_frame = self.display_frame_count,
                                 "AVC444 encode returned EMPTY data — frame dropped!"
                             );
-                            return Ok(None);
+                            self.note_empty_encode();
+                                return Ok(None);
                         }
                         Err(e) => {
                             tracing::warn!(display_frame = self.display_frame_count, "AVC444 encode failed: {e}, falling back to AVC420");
@@ -839,6 +889,7 @@ impl MacDisplayUpdates {
                             }
                         }
                         self.needs_full_frame = false;
+                                self.empty_encodes = 0;
                                 return Ok(Some(DisplayUpdate::GfxFrame(GfxFrameUpdate {
                             h264_data: encoded.data,
                             width: frame.width as u16,
@@ -854,7 +905,8 @@ impl MacDisplayUpdates {
                             display_frame = self.display_frame_count,
                             "H.264 encode returned EMPTY data — frame dropped!"
                         );
-                        return Ok(None);
+                        self.note_empty_encode();
+                                return Ok(None);
                     }
                     Err(e) => {
                         tracing::warn!(display_frame = self.display_frame_count, "H.264 encode failed: {e}");
