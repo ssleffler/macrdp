@@ -6,7 +6,7 @@ use ironrdp_core::{encode_vec, impl_as_any, Encode, WriteCursor, EncodeResult};
 use ironrdp_dvc::{DvcEncode, DvcProcessor, DvcServerProcessor};
 use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::rdp::vc::dvc::gfx::{
-    Avc420BitmapStream, Avc444BitmapStream, CapabilitiesConfirmPdu, CapabilitiesV10Flags,
+    Avc420BitmapStream, Avc444BitmapStream, CapabilitiesAdvertisePdu, CapabilitiesConfirmPdu, CapabilitiesV10Flags,
     CapabilitiesV103Flags, CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitiesV81Flags,
     CapabilitySet, ClientPdu, Codec1Type, CreateSurfacePdu, EndFramePdu, Encoding,
     MapSurfaceToOutputPdu, PixelFormat as GfxPixelFormat, QuantQuality, ResetGraphicsPdu,
@@ -334,13 +334,50 @@ impl GfxState {
 /// GFX DVC processor
 pub struct GfxHandler {
     pub state: Arc<Mutex<GfxState>>,
+    /// ZGFX history for client-to-server data (clients may compress it)
+    decompressor: ironrdp_graphics::zgfx::Decompressor,
+}
+
+/// RDPGFX_CMDID_CAPSADVERTISE
+const CMDID_CAPS_ADVERTISE: u16 = 0x12;
+/// RDPGFX_HEADER: cmdId(2) + flags(2) + pduLength(4)
+const GFX_HEADER_SIZE: usize = 8;
+
+/// Parses a CapabilitiesAdvertise body, skipping capability sets this build
+/// doesn't know. Newer clients (e.g. the Windows App) advertise versions past
+/// 10.7; the stock decoder rejects the whole PDU for one unknown version,
+/// which left the session without graphics (a black screen).
+fn parse_caps_advertise(body: &[u8]) -> Vec<CapabilitySet> {
+    let mut sets = Vec::new();
+    if body.len() < 2 {
+        return sets;
+    }
+    let count = u16::from_le_bytes([body[0], body[1]]) as usize;
+    let mut offset = 2;
+    for _ in 0..count {
+        if offset + 8 > body.len() {
+            break;
+        }
+        let version = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap());
+        let len = u32::from_le_bytes(body[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let end = offset + 8 + len;
+        if end > body.len() {
+            break;
+        }
+        match decode::<CapabilitySet>(&body[offset..end]) {
+            Ok(set) => sets.push(set),
+            Err(_) => info!("GFX: skipping capability set version {version:#x} ({len} bytes)"),
+        }
+        offset = end;
+    }
+    sets
 }
 
 impl_as_any!(GfxHandler);
 
 impl GfxHandler {
     pub fn new(state: Arc<Mutex<GfxState>>) -> Self {
-        Self { state }
+        Self { state, decompressor: ironrdp_graphics::zgfx::Decompressor::new() }
     }
 
     /// Create a single ZGFX-wrapped buffer containing all GFX PDUs for an H.264 frame.
@@ -625,27 +662,68 @@ impl DvcProcessor for GfxHandler {
 
     fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
         info!(channel_id, "GFX channel opened");
+        self.decompressor = ironrdp_graphics::zgfx::Decompressor::new();
         let mut state = self.state.lock().unwrap();
         state.channel_id = Some(channel_id);
         Ok(Vec::new())
     }
 
     fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
-        // Client GFX data is also ZGFX-wrapped. Unwrap the ZGFX layer first.
-        let raw_data = unwrap_zgfx(payload);
-        let data = raw_data.as_deref().unwrap_or(payload);
-
-        let client_pdu: ClientPdu = match decode(data) {
-            Ok(pdu) => pdu,
+        // Client GFX data is ZGFX-wrapped and may be compressed.
+        let mut decompressed = Vec::new();
+        let data: Vec<u8> = match self.decompressor.decompress(payload, &mut decompressed) {
+            Ok(_) => decompressed,
             Err(e) => {
-                // Unknown PDU type (e.g., QoE FrameAcknowledge 0x16, CacheImportOffer 0x10)
-                // Log and ignore rather than crashing the connection
-                debug!(
-                    payload_len = data.len(),
-                    first_bytes = ?&data[..data.len().min(8)],
-                    "GFX: ignoring unknown client PDU: {e}"
-                );
-                return Ok(Vec::new());
+                debug!("GFX: ZGFX decompress failed ({e}), trying raw unwrap");
+                unwrap_zgfx(payload).unwrap_or_else(|| payload.to_vec())
+            }
+        };
+
+        // One message can carry several PDUs back to back
+        let mut messages = Vec::new();
+        let mut offset = 0;
+        while offset + GFX_HEADER_SIZE <= data.len() {
+            let len = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let end = if len >= GFX_HEADER_SIZE && offset + len <= data.len() { offset + len } else { data.len() };
+            messages.extend(self.process_pdu(&data[offset..end])?);
+            offset = end;
+        }
+        Ok(messages)
+    }
+
+    fn close(&mut self, channel_id: u32) {
+        info!(channel_id, "GFX channel closed");
+        let mut state = self.state.lock().unwrap();
+        state.channel_id = None;
+        state.surface_created = false;
+        state.caps_confirmed = false;
+        state.avc420_supported = false;
+        state.avc444_supported = false;
+        state.confirmed_cap = None;
+    }
+}
+
+impl DvcServerProcessor for GfxHandler {}
+
+impl GfxHandler {
+    /// Handles one client PDU (header included).
+    fn process_pdu(&mut self, data: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        let cmd_id = u16::from_le_bytes([data[0], data[1]]);
+        let client_pdu: ClientPdu = if cmd_id == CMDID_CAPS_ADVERTISE {
+            ClientPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu(parse_caps_advertise(&data[GFX_HEADER_SIZE..])))
+        } else {
+            match decode(data) {
+                Ok(pdu) => pdu,
+                Err(e) => {
+                    // Unknown PDU type (e.g., QoE FrameAcknowledge 0x16, CacheImportOffer 0x10)
+                    // Log and ignore rather than crashing the connection
+                    debug!(
+                        payload_len = data.len(),
+                        first_bytes = ?&data[..data.len().min(8)],
+                        "GFX: ignoring unknown client PDU: {e}"
+                    );
+                    return Ok(Vec::new());
+                }
             }
         };
 
@@ -789,20 +867,7 @@ impl DvcProcessor for GfxHandler {
             }
         }
     }
-
-    fn close(&mut self, channel_id: u32) {
-        info!(channel_id, "GFX channel closed");
-        let mut state = self.state.lock().unwrap();
-        state.channel_id = None;
-        state.surface_created = false;
-        state.caps_confirmed = false;
-        state.avc420_supported = false;
-        state.avc444_supported = false;
-        state.confirmed_cap = None;
-    }
 }
-
-impl DvcServerProcessor for GfxHandler {}
 
 #[cfg(test)]
 mod flow_control_tests {
@@ -848,5 +913,23 @@ mod flow_control_tests {
         assert_eq!(s.frames_in_flight(), 0);
         s.next_frame_id();
         assert!(s.frame_send_times.is_empty(), "no send-time tracking once suspended");
+    }
+
+    #[test]
+    fn caps_advertise_skips_unknown_versions() {
+        use super::{parse_caps_advertise, CapabilitySet};
+        // count=3: an unknown future version, V10.7, V8.1
+        let mut body = vec![3u8, 0];
+        for (version, data) in [(0x000B_0000u32, vec![0u8; 12]), (0x000A_0701, vec![0; 4]), (0x0008_0105, vec![0x10, 0, 0, 0])] {
+            body.extend_from_slice(&version.to_le_bytes());
+            body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            body.extend_from_slice(&data);
+        }
+        let sets = parse_caps_advertise(&body);
+        assert_eq!(sets.len(), 2);
+        assert!(matches!(sets[0], CapabilitySet::V10_7 { .. }));
+        assert!(matches!(sets[1], CapabilitySet::V8_1 { .. }));
+        // truncated input doesn't panic
+        assert_eq!(parse_caps_advertise(&body[..11]).len(), 0);
     }
 }
