@@ -8,7 +8,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$(cd "$HERE/../.." && pwd)"
-VERSION="0.2.8"
+VERSION="0.2.14"
 OUT="$HERE/dist/macrdp-$VERSION.pkg"
 BUILD="$HERE/build"
 ROOT="$BUILD/root"
@@ -33,10 +33,14 @@ lipo -create \
     "$SRC/target/aarch64-apple-darwin/release/macrdp-server" \
     "$SRC/target/x86_64-apple-darwin/release/macrdp-server" \
     -output "$BIN"
-# Load Swift concurrency from macOS itself, not from the Command Line Tools
-# (avoids duplicate-class warnings and works on Macs without developer tools).
-install_name_tool -delete_rpath /Library/Developer/CommandLineTools/usr/lib/swift-5.5/macosx \
-    -add_rpath /usr/lib/swift "$BIN"
+# Load Swift concurrency from macOS itself, not from the build machine's
+# developer tools (avoids duplicate-class warnings and works on Macs without
+# them). The toolchain rpath differs between Xcode and the Command Line Tools,
+# so drop whatever is there.
+otool -l "$BIN" | awk '/LC_RPATH/{r=1} r && $1=="path"{print $2; r=0}' | sort -u | while read -r rpath; do
+    install_name_tool -delete_rpath "$rpath" "$BIN"
+done
+install_name_tool -add_rpath /usr/lib/swift "$BIN"
 codesign --force --sign - --identifier com.macrdp.server "$APP"
 ln -sf /Applications/macrdp.app/Contents/MacOS/macrdp-server "$ROOT/usr/local/bin/macrdp-server"
 
