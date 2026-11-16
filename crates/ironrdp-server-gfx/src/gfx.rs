@@ -136,6 +136,19 @@ fn make_dvc_message(pdu: &ServerPdu) -> PduResult<DvcMessage> {
 
 /// Shared state between GfxHandler and the server
 #[derive(Debug)]
+/// What happened since the last QoE stats log line
+#[derive(Default)]
+struct QoeStats {
+    window_start: Option<std::time::Instant>,
+    frame_id_at_start: u32,
+    acks: u32,
+    /// Client-reported decode+render time per frame (timeDiffEDR), ms
+    decode_sum: u64,
+    decode_max: u16,
+    rtt_max: f64,
+    in_flight_max: u32,
+}
+
 pub struct GfxState {
     pub channel_id: Option<u32>,
     pub surface_created: bool,
@@ -154,6 +167,18 @@ pub struct GfxState {
     /// The client told us (QueueDepth::Suspend) or showed us (no acks for
     /// seconds) that it won't acknowledge frames: flow control is off.
     pub acks_suspended: bool,
+    /// Frame acknowledgements received in this session
+    pub acks_received: u64,
+    /// The client sends QoE frame acknowledgements (one per decoded frame);
+    /// they keep flow control working while regular ones are suspended
+    pub qoe_acks: bool,
+    /// Shortest send-to-acknowledge time seen this session: the client's
+    /// normal pipeline delay (network + decode + present), without any queue
+    pub rtt_min_ms: f64,
+    /// Time between frames at the session's frame rate
+    pub frame_interval_ms: f64,
+    /// Per-window statistics for the QoE stats log line
+    qoe_stats: QoeStats,
     /// Last acknowledged frame ID
     pub last_ack_frame: u32,
     /// Network quality estimate (0.0 = congested, 1.0 = excellent)
@@ -204,6 +229,11 @@ impl GfxState {
             height,
             pending_acks: 0,
             acks_suspended: false,
+            acks_received: 0,
+            qoe_acks: false,
+            rtt_min_ms: f64::INFINITY,
+            frame_interval_ms: 1000.0 / 60.0,
+            qoe_stats: QoeStats::default(),
             last_ack_frame: 0,
             network_quality: 1.0,
             frame_send_times: std::collections::HashMap::new(),
@@ -244,6 +274,7 @@ impl GfxState {
         if !self.acks_suspended {
             self.frame_send_times.insert(self.frame_id, std::time::Instant::now());
         }
+        self.qoe_stats.in_flight_max = self.qoe_stats.in_flight_max.max(self.frames_in_flight());
         // Limit map size to prevent unbounded growth
         if self.frame_send_times.len() > 120 {
             let cutoff = self.frame_id.saturating_sub(120);
@@ -263,25 +294,44 @@ impl GfxState {
     }
 
     /// Whether the next frame should wait: the client is more than
-    /// `max_in_flight` frames behind and is still acknowledging. A client that
-    /// hasn't acknowledged its oldest outstanding frame within `stall_timeout`
-    /// is treated as not acknowledging at all, so it can't freeze the stream.
+    /// `max_in_flight` frames behind. If it hasn't acknowledged its oldest
+    /// outstanding frame within `stall_timeout`, those frames are written off
+    /// so the stream can't freeze: a client that has acknowledged before keeps
+    /// flow control (it was only slow, e.g. starting its decoder); one that
+    /// never has is treated as not acknowledging at all.
     pub fn client_is_behind(&mut self, max_in_flight: u32, stall_timeout: std::time::Duration) -> bool {
+        let max_in_flight = self.allowed_in_flight(max_in_flight);
         if self.acks_suspended || self.frames_in_flight() <= max_in_flight {
             return false;
         }
         let oldest_unacked = self.frame_send_times.values().min().copied();
         match oldest_unacked {
             Some(sent) if sent.elapsed() > stall_timeout => {
-                tracing::warn!(
-                    in_flight = self.frames_in_flight(),
-                    "Client stopped acknowledging frames — sending without flow control"
-                );
-                self.suspend_acks();
+                if self.acks_received == 0 && self.frame_id > max_in_flight * 3 {
+                    tracing::warn!("Client never acknowledges frames — sending without flow control");
+                    self.suspend_acks();
+                } else {
+                    tracing::info!(in_flight = self.frames_in_flight(), "Client acknowledgements stalled — continuing");
+                    self.forgive_outstanding();
+                }
                 false
             }
             _ => true,
         }
+    }
+
+    /// Frames that may be unacknowledged before new ones are held back: the
+    /// configured minimum, or enough to cover the client's normal pipeline
+    /// delay plus two frames of slack. Some clients (the Windows App) take
+    /// 50-80 ms to acknowledge even with nothing queued; a fixed limit of 3
+    /// made the server hold frames every second, which showed as stutter.
+    pub fn allowed_in_flight(&self, configured: u32) -> u32 {
+        const MAX_ADAPTIVE: u32 = 10;
+        if !self.rtt_min_ms.is_finite() {
+            return configured;
+        }
+        let pipeline = (self.rtt_min_ms / self.frame_interval_ms.max(1.0)).ceil() as u32;
+        configured.max((pipeline + 2).min(MAX_ADAPTIVE))
     }
 
     pub fn suspend_acks(&mut self) {
@@ -289,16 +339,85 @@ impl GfxState {
         self.frame_send_times.clear();
     }
 
+    /// The client is acknowledging again: flow control back on, from now.
+    pub fn resume_acks(&mut self) {
+        self.acks_suspended = false;
+        self.forgive_outstanding();
+    }
+
+    /// Stops waiting for acknowledgements of frames already sent.
+    fn forgive_outstanding(&mut self) {
+        self.last_ack_frame = self.frame_id;
+        self.frame_send_times.clear();
+        self.pending_acks = 0;
+    }
+
+    /// Starts flow control afresh for a new session (this state outlives sessions).
+    pub fn reset_flow_control(&mut self) {
+        self.acks_suspended = false;
+        self.acks_received = 0;
+        self.qoe_acks = false;
+        self.rtt_min_ms = f64::INFINITY;
+        self.qoe_stats = QoeStats::default();
+        self.rtt_ewma_ms = 0.0;
+        self.forgive_outstanding();
+    }
+
+    /// A QoE frame acknowledgement: the client decoded this frame. Newer
+    /// clients (the Windows App) send these for every frame while keeping the
+    /// regular acknowledgements suspended most of the time.
+    pub fn qoe_ack_frame(&mut self, frame_id: u32, decode_ms: u16) {
+        let rtt = self.frame_send_times.get(&frame_id).map(|t| t.elapsed().as_secs_f64() * 1000.0);
+        let now = std::time::Instant::now();
+        let st = &mut self.qoe_stats;
+        st.acks += 1;
+        st.decode_sum += decode_ms as u64;
+        st.decode_max = st.decode_max.max(decode_ms);
+        if let Some(rtt) = rtt {
+            st.rtt_max = st.rtt_max.max(rtt);
+        }
+        let start = *st.window_start.get_or_insert(now);
+        if st.acks >= 60 {
+            let secs = now.duration_since(start).as_secs_f64().max(0.001);
+            let sent = self.frame_id.saturating_sub(st.frame_id_at_start);
+            tracing::info!(
+                "QoE {:.0} fps acked, {:.0} sent | RTT {:.0}ms min, {:.0} avg, {:.0} max | client decode {:.1}ms avg, {} max | encode {:.1}ms | in flight max {} | {}KB/f",
+                st.acks as f64 / secs,
+                sent as f64 / secs,
+                self.rtt_min_ms,
+                self.rtt_ewma_ms,
+                st.rtt_max,
+                st.decode_sum as f64 / st.acks as f64,
+                st.decode_max,
+                self.last_encode_ms,
+                st.in_flight_max,
+                self.last_frame_bytes / 1024,
+            );
+            self.qoe_stats = QoeStats { window_start: Some(now), frame_id_at_start: self.frame_id, ..Default::default() };
+        }
+        if !self.qoe_acks {
+            tracing::info!("Client sends QoE frame acknowledgements — using them for flow control");
+            self.qoe_acks = true;
+            if self.acks_suspended {
+                self.resume_acks();
+            }
+        }
+        self.ack_frame(frame_id);
+    }
+
     /// Update network quality and RTT based on frame acknowledgment
     pub fn ack_frame(&mut self, ack_frame_id: u32) {
+        self.acks_received += 1;
         self.last_ack_frame = self.last_ack_frame.max(ack_frame_id);
+        let sent_at = self.frame_send_times.get(&ack_frame_id).copied();
         // Everything up to the acked frame is done, even if it wasn't acked itself
         self.frame_send_times.retain(|&id, _| id > ack_frame_id);
         self.pending_acks = self.frames_in_flight();
 
         // Calculate RTT from send timestamp
-        if let Some(send_time) = self.frame_send_times.remove(&ack_frame_id) {
+        if let Some(send_time) = sent_at {
             let rtt_ms = send_time.elapsed().as_secs_f64() * 1000.0;
+            self.rtt_min_ms = self.rtt_min_ms.min(rtt_ms);
             // EWMA with alpha=0.2 for smooth averaging
             if self.rtt_ewma_ms == 0.0 {
                 self.rtt_ewma_ms = rtt_ms;
@@ -336,10 +455,34 @@ pub struct GfxHandler {
     pub state: Arc<Mutex<GfxState>>,
     /// ZGFX history for client-to-server data (clients may compress it)
     decompressor: ironrdp_graphics::zgfx::Decompressor,
+    /// Unknown message types already reported in the log
+    unknown_cmds_logged: std::collections::HashSet<u16>,
+}
+
+/// Ranks a capability set for selection: (allows H.264, version order), plus
+/// whether it allows AVC420 and AVC444. None for sets this server can't use.
+fn cap_rank(cap: &CapabilitySet) -> Option<((bool, u8), bool, bool)> {
+    let (order, avc420, avc444) = match cap {
+        CapabilitySet::V8 { .. } => (0, false, false),
+        CapabilitySet::V8_1 { flags } => (1, flags.contains(CapabilitiesV81Flags::AVC420_ENABLED), false),
+        CapabilitySet::V10 { flags } => (2, !flags.contains(CapabilitiesV10Flags::AVC_DISABLED), true),
+        CapabilitySet::V10_1 => (3, true, true),
+        CapabilitySet::V10_2 { flags } => (4, !flags.contains(CapabilitiesV10Flags::AVC_DISABLED), true),
+        CapabilitySet::V10_3 { flags } => (5, !flags.contains(CapabilitiesV103Flags::AVC_DISABLED), true),
+        CapabilitySet::V10_4 { flags } => (6, !flags.contains(CapabilitiesV104Flags::AVC_DISABLED), true),
+        CapabilitySet::V10_5 { flags } => (7, !flags.contains(CapabilitiesV104Flags::AVC_DISABLED), true),
+        CapabilitySet::V10_6 { flags } => (8, !flags.contains(CapabilitiesV104Flags::AVC_DISABLED), true),
+        CapabilitySet::V10_6Err { flags } => (9, !flags.contains(CapabilitiesV104Flags::AVC_DISABLED), true),
+        CapabilitySet::V10_7 { flags } => (10, !flags.contains(CapabilitiesV107Flags::AVC_DISABLED), true),
+        _ => return None,
+    };
+    Some(((avc420, order), avc420, avc420 && avc444))
 }
 
 /// RDPGFX_CMDID_CAPSADVERTISE
 const CMDID_CAPS_ADVERTISE: u16 = 0x12;
+/// RDPGFX_CMDID_QOEFRAMEACKNOWLEDGE: frameId(4) timestamp(4) timeDiffSE(2) timeDiffEDR(2)
+const CMDID_QOE_FRAME_ACK: u16 = 0x16;
 /// RDPGFX_HEADER: cmdId(2) + flags(2) + pduLength(4)
 const GFX_HEADER_SIZE: usize = 8;
 
@@ -377,7 +520,11 @@ impl_as_any!(GfxHandler);
 
 impl GfxHandler {
     pub fn new(state: Arc<Mutex<GfxState>>) -> Self {
-        Self { state, decompressor: ironrdp_graphics::zgfx::Decompressor::new() }
+        Self {
+            state,
+            decompressor: ironrdp_graphics::zgfx::Decompressor::new(),
+            unknown_cmds_logged: std::collections::HashSet::new(),
+        }
     }
 
     /// Create a single ZGFX-wrapped buffer containing all GFX PDUs for an H.264 frame.
@@ -663,7 +810,9 @@ impl DvcProcessor for GfxHandler {
     fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
         info!(channel_id, "GFX channel opened");
         self.decompressor = ironrdp_graphics::zgfx::Decompressor::new();
+        self.unknown_cmds_logged.clear();
         let mut state = self.state.lock().unwrap();
+        state.reset_flow_control();
         state.channel_id = Some(channel_id);
         Ok(Vec::new())
     }
@@ -709,6 +858,17 @@ impl GfxHandler {
     /// Handles one client PDU (header included).
     fn process_pdu(&mut self, data: &[u8]) -> PduResult<Vec<DvcMessage>> {
         let cmd_id = u16::from_le_bytes([data[0], data[1]]);
+        if cmd_id == CMDID_QOE_FRAME_ACK {
+            if data.len() >= GFX_HEADER_SIZE + 4 {
+                let frame_id = u32::from_le_bytes(data[GFX_HEADER_SIZE..GFX_HEADER_SIZE + 4].try_into().unwrap());
+                // timestamp(4), timeDiffSE(2), then timeDiffEDR(2): decode + render time in ms
+                let decode_ms = data
+                    .get(GFX_HEADER_SIZE + 10..GFX_HEADER_SIZE + 12)
+                    .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+                self.state.lock().unwrap().qoe_ack_frame(frame_id, decode_ms);
+            }
+            return Ok(Vec::new());
+        }
         let client_pdu: ClientPdu = if cmd_id == CMDID_CAPS_ADVERTISE {
             ClientPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu(parse_caps_advertise(&data[GFX_HEADER_SIZE..])))
         } else {
@@ -717,6 +877,9 @@ impl GfxHandler {
                 Err(e) => {
                     // Unknown PDU type (e.g., QoE FrameAcknowledge 0x16, CacheImportOffer 0x10)
                     // Log and ignore rather than crashing the connection
+                    if self.unknown_cmds_logged.insert(cmd_id) {
+                        info!(cmd_id = format!("{cmd_id:#x}"), len = data.len(), "GFX: client sends a message type this server ignores");
+                    }
                     debug!(
                         payload_len = data.len(),
                         first_bytes = ?&data[..data.len().min(8)],
@@ -740,68 +903,23 @@ impl GfxHandler {
                     return Ok(Vec::new());
                 }
 
-                let mut best_cap = None;
-
-                for cap in cap_sets {
-                    match cap {
-                        CapabilitySet::V10_7 { flags } if !flags.contains(CapabilitiesV107Flags::AVC_DISABLED) => {
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            best_cap = Some(cap.clone());
-                            break;
-                        }
-                        CapabilitySet::V10_6 { flags } | CapabilitySet::V10_6Err { flags }
-                            if !flags.contains(CapabilitiesV104Flags::AVC_DISABLED) =>
-                        {
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            best_cap = Some(cap.clone());
-                        }
-                        CapabilitySet::V10_5 { flags } | CapabilitySet::V10_4 { flags }
-                            if !flags.contains(CapabilitiesV104Flags::AVC_DISABLED) =>
-                        {
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                        CapabilitySet::V10_3 { flags }
-                            if !flags.contains(CapabilitiesV103Flags::AVC_DISABLED) =>
-                        {
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                        CapabilitySet::V10_2 { flags } | CapabilitySet::V10 { flags }
-                            if !flags.contains(CapabilitiesV10Flags::AVC_DISABLED) =>
-                        {
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                        CapabilitySet::V10_1 => {
-                            // V10_1 has no AVC_DISABLED flag — always supports AVC
-                            state.avc420_supported = true;
-                            state.avc444_supported = true;
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                        CapabilitySet::V8_1 { flags }
-                            if flags.contains(CapabilitiesV81Flags::AVC420_ENABLED) =>
-                        {
-                            state.avc420_supported = true;
-                            // V8.1 only supports AVC420, not AVC444
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                        _ => {
-                            if best_cap.is_none() { best_cap = Some(cap.clone()); }
-                        }
-                    }
+                // Confirm the newest version the client offers that allows H.264.
+                // (Taking the first one confirmed V8 for clients whose list has
+                // no 10.6/10.7; V8 has no H.264, so the client dropped the
+                // connection at the first frame.)
+                let best = cap_sets.iter().filter_map(|c| cap_rank(c).map(|r| (r, c))).max_by_key(|(r, _)| *r);
+                if let Some(((_, avc420, avc444), _)) = best {
+                    state.avc420_supported = avc420;
+                    state.avc444_supported = avc444;
                 }
+                let best_cap = best.map(|(_, c)| c.clone());
 
                 let confirmed = best_cap.unwrap_or(CapabilitySet::V8 {
                     flags: ironrdp_pdu::rdp::vc::dvc::gfx::CapabilitiesV8Flags::empty(),
                 });
 
                 info!(
+                    confirmed = ?confirmed,
                     avc420 = state.avc420_supported,
                     avc444_client = state.avc444_supported,
                     avc444_enabled = state.avc444_enabled,
@@ -822,9 +940,18 @@ impl GfxHandler {
 
             ClientPdu::FrameAcknowledge(ack) => {
                 let mut state = self.state.lock().unwrap();
-                if ack.queue_depth == QueueDepth::Suspend && !state.acks_suspended {
-                    info!("Client suspended frame acknowledgements — flow control off");
-                    state.suspend_acks();
+                // QueueDepth::Suspend: the client stops acknowledging until an
+                // acknowledgement with any other queue depth arrives
+                if state.qoe_acks {
+                    // QoE acknowledgements keep coming either way
+                } else if ack.queue_depth == QueueDepth::Suspend {
+                    if !state.acks_suspended {
+                        info!("Client suspended frame acknowledgements — flow control off");
+                        state.suspend_acks();
+                    }
+                } else if state.acks_suspended {
+                    info!("Client resumed frame acknowledgements — flow control on");
+                    state.resume_acks();
                 }
                 state.ack_frame(ack.frame_id);
 
@@ -908,11 +1035,60 @@ mod flow_control_tests {
         for _ in 0..5 {
             s.next_frame_id();
         }
+        // Early in a session a stall only writes the frames off
         assert!(!s.client_is_behind(3, Duration::ZERO), "stalled client must not block");
-        assert!(s.acks_suspended);
+        assert!(!s.acks_suspended);
         assert_eq!(s.frames_in_flight(), 0);
+        // Still nothing acknowledged after many frames: flow control off
+        for _ in 0..10 {
+            s.next_frame_id();
+        }
+        assert!(!s.client_is_behind(3, Duration::ZERO));
+        assert!(s.acks_suspended);
         s.next_frame_id();
         assert!(s.frame_send_times.is_empty(), "no send-time tracking once suspended");
+    }
+
+    #[test]
+    fn slow_start_keeps_flow_control() {
+        let mut s = GfxState::new(1920, 1080, false);
+        for _ in 0..4 {
+            s.next_frame_id();
+        }
+        s.ack_frame(1);
+        for _ in 0..12 {
+            s.next_frame_id();
+        }
+        // stalled, but this client has acknowledged before
+        assert!(!s.client_is_behind(3, Duration::ZERO));
+        assert!(!s.acks_suspended);
+        for _ in 0..4 {
+            s.next_frame_id();
+        }
+        assert!(s.client_is_behind(3, PATIENT), "flow control still applies");
+    }
+
+    #[test]
+    fn suspend_resume_and_new_session() {
+        let mut s = GfxState::new(1920, 1080, false);
+        for _ in 0..6 {
+            s.next_frame_id();
+        }
+        s.suspend_acks();
+        assert!(!s.client_is_behind(3, PATIENT));
+        for _ in 0..50 {
+            s.next_frame_id();
+        }
+        s.resume_acks();
+        assert_eq!(s.frames_in_flight(), 0);
+        for _ in 0..4 {
+            s.next_frame_id();
+        }
+        assert!(s.client_is_behind(3, PATIENT));
+        s.suspend_acks();
+        s.reset_flow_control();
+        assert!(!s.acks_suspended);
+        assert_eq!((s.frames_in_flight(), s.acks_received), (0, 0));
     }
 
     #[test]
@@ -931,5 +1107,65 @@ mod flow_control_tests {
         assert!(matches!(sets[1], CapabilitySet::V8_1 { .. }));
         // truncated input doesn't panic
         assert_eq!(parse_caps_advertise(&body[..11]).len(), 0);
+    }
+
+    #[test]
+    fn qoe_acks_keep_flow_control_while_regular_acks_are_suspended() {
+        let mut s = GfxState::new(1920, 1080, false);
+        for _ in 0..2 {
+            s.next_frame_id();
+        }
+        s.suspend_acks(); // client: "no more regular acks"
+        s.qoe_ack_frame(2, 5);
+        assert!(s.qoe_acks && !s.acks_suspended);
+        for _ in 0..4 {
+            s.next_frame_id();
+        }
+        assert_eq!(s.frames_in_flight(), 4);
+        assert!(s.client_is_behind(3, PATIENT));
+        s.qoe_ack_frame(5, 5);
+        assert!(!s.client_is_behind(3, PATIENT));
+    }
+
+    #[test]
+    fn limit_adapts_to_the_clients_pipeline_delay() {
+        let mut s = GfxState::new(1920, 1080, false);
+        assert_eq!(s.allowed_in_flight(3), 3); // nothing measured yet
+        s.rtt_min_ms = 5.0; // fast client: configured limit stands
+        assert_eq!(s.allowed_in_flight(3), 3);
+        s.rtt_min_ms = 60.0; // 4 frames of pipeline at 60 fps, + 2
+        assert_eq!(s.allowed_in_flight(3), 6);
+        s.rtt_min_ms = 900.0; // capped
+        assert_eq!(s.allowed_in_flight(3), 10);
+        s.rtt_min_ms = 60.0;
+        for _ in 0..6 {
+            s.next_frame_id();
+        }
+        assert!(!s.client_is_behind(3, PATIENT));
+        s.next_frame_id();
+        assert!(s.client_is_behind(3, PATIENT));
+    }
+
+    #[test]
+    fn picks_newest_h264_capable_version() {
+        use super::{cap_rank, CapabilitiesV104Flags, CapabilitiesV81Flags, CapabilitySet};
+        use ironrdp_pdu::rdp::vc::dvc::gfx::CapabilitiesV8Flags;
+        let pick = |sets: &[CapabilitySet]| {
+            sets.iter().filter_map(|c| cap_rank(c).map(|r| (r, c.clone()))).max_by_key(|(r, _)| r.0).map(|(_, c)| c)
+        };
+        // A client without 10.6/10.7: must not end up on V8
+        let sets = [
+            CapabilitySet::V8 { flags: CapabilitiesV8Flags::empty() },
+            CapabilitySet::V8_1 { flags: CapabilitiesV81Flags::AVC420_ENABLED },
+            CapabilitySet::V10_4 { flags: CapabilitiesV104Flags::empty() },
+            CapabilitySet::V10_5 { flags: CapabilitiesV104Flags::empty() },
+        ];
+        assert!(matches!(pick(&sets), Some(CapabilitySet::V10_5 { .. })));
+        // Newer version with H.264 disabled loses to an older one that allows it
+        let sets = [
+            CapabilitySet::V8_1 { flags: CapabilitiesV81Flags::AVC420_ENABLED },
+            CapabilitySet::V10_5 { flags: CapabilitiesV104Flags::AVC_DISABLED },
+        ];
+        assert!(matches!(pick(&sets), Some(CapabilitySet::V8_1 { .. })));
     }
 }

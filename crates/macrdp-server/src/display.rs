@@ -284,6 +284,7 @@ impl RdpServerDisplay for MacDisplay {
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+
         let mut capture_config = CaptureConfig {
             width: self.width as u32,
             height: self.height as u32,
@@ -296,6 +297,8 @@ impl RdpServerDisplay for MacDisplay {
             show_cursor: self.show_cursor,
             display_id: None,
         };
+        self.gfx_state.lock().unwrap().frame_interval_ms = 1000.0 / self.frame_rate.max(1) as f64;
+
         // Give this session a display at the client's size (dropped with the session)
         let virtual_display = self.prepare_display(&mut capture_config).await;
         capture_config.width = self.width as u32;
