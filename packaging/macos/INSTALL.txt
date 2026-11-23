@@ -37,8 +37,9 @@ INSTALL
    Click "Open System Settings" in each prompt and switch macrdp ON.
    macrdp restarts by itself once Accessibility is on.
 
-4. A macrdp window then shows the RDP username and, on a first install, a new
-   random password. Copy it somewhere safe (it's also in the config file).
+4. On a first install a macrdp window asks for the RDP password: type one and
+   click "Set Password", or click "Open Config File" and set it there
+   (macrdp restarts when you save). The RDP username is your Mac username.
 
 5. Check it worked:
      grep -E "Screen Recording|Accessibility" ~/Library/Logs/macrdp/macrdp.log | tail -2

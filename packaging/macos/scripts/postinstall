@@ -1,6 +1,16 @@
 #!/bin/bash
 # Set up macrdp for the installing user (and everyone who already had it),
-# start it so macOS asks for its two permissions right away, and say so.
+# start it so macOS asks for its two permissions right away, let a new user
+# choose the RDP password, and say so.
+
+# Writes $MACRDP_PW as the password in a user's config.toml (TOML-escaped;
+# passed in the environment so no shell or awk quoting touches it).
+set_password() {
+    local config="$1" owner="$2" tmp="$1.new"
+    (umask 077; awk 'BEGIN { p = ENVIRON["MACRDP_PW"]; gsub(/\\/, "\\\\", p); gsub(/"/, "\\\"", p) }
+        !done && /^password = / { print "password = \"" p "\""; done = 1; next } { print }' "$config" > "$tmp") \
+        && chown "$owner" "$tmp" && mv "$tmp" "$config"
+}
 
 # A new build is a new program to macOS, so earlier grants no longer match.
 # Clear them so macOS asks again now, instead of failing silently later.
@@ -38,25 +48,48 @@ for u in $users; do
     # No GUI session for this user: nothing to show
     launchctl print "gui/$uid" >/dev/null 2>&1 || continue
 
+    config="$(dscl . -read "/Users/$u" NFSHomeDirectory | awk '{print $2}')/.config/macrdp/config.toml"
     if [ -n "$new_password" ]; then
-        login_text="RDP login\\n   Username: $u\\n   Password: (shown below, select to copy)\\n\\nChange it any time in ~/.config/macrdp/config.toml"
+        login_text="RDP username: $u"
     else
         login_text="Your existing settings in ~/.config/macrdp/config.toml were kept."
     fi
     msg="macrdp is installed and starts automatically when you log in.\\n\\n$login_text\\n\\nmacOS is asking for two permissions for macrdp. Allow both:\\n  • Screen & System Audio Recording\\n  • Accessibility (keyboard and mouse control)\\nIn System Settings switch macrdp on. macrdp restarts by itself once Accessibility is on."
     open_settings='if button returned of result is "Open Accessibility Settings" then do shell script "open \"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility\""'
 
-    # Show the dialog in the background so the installer never waits on it.
+    # Show the dialogs in the background so the installer never waits on them.
     (
+        # New config: the user picks the password (until then it's a random
+        # one nobody was shown, so the server is never open).
         if [ -n "$new_password" ]; then
-            launchctl asuser "$uid" sudo -u "$u" osascript \
-                -e "display dialog \"$msg\" default answer \"$new_password\" with title \"macrdp\" buttons {\"Open Accessibility Settings\", \"OK\"} default button \"OK\" giving up after 1800" \
-                -e "$open_settings"
-        else
-            launchctl asuser "$uid" sudo -u "$u" osascript \
-                -e "display dialog \"$msg\" with title \"macrdp\" buttons {\"Open Accessibility Settings\", \"OK\"} default button \"OK\" giving up after 1800" \
-                -e "$open_settings"
+            answer=$(launchctl asuser "$uid" sudo -u "$u" osascript - "$u" <<'EOF'
+on run argv
+    repeat
+        set r to display dialog "Choose the password for RDP logins to this Mac (username: " & (item 1 of argv) & ")." & linefeed & linefeed & "Type it here, or open the config file and set it there." default answer "" with title "macrdp" buttons {"Open Config File", "Set Password"} default button "Set Password" giving up after 1800
+        if gave up of r then return ""
+        if button returned of r is "Open Config File" then return "open"
+        if text returned of r is not "" then return "set" & linefeed & text returned of r
+    end repeat
+end run
+EOF
+            )
+            action=$(printf '%s\n' "$answer" | head -n 1)
+            restart="launchctl kickstart -k gui/$uid/com.macrdp.server"
+            if [ "$action" = set ]; then
+                MACRDP_PW=$(printf '%s\n' "$answer" | sed -n 2p) set_password "$config" "$u" && $restart
+            elif [ "$action" = open ]; then
+                before=$(stat -f%m "$config")
+                launchctl asuser "$uid" sudo -u "$u" open -e "$config"
+                # Restart macrdp once the edited file is saved (waits up to 30 min)
+                for _ in $(seq 360); do
+                    sleep 5
+                    [ "$(stat -f%m "$config" 2>/dev/null)" != "$before" ] && { $restart; break; }
+                done
+            fi
         fi
+        launchctl asuser "$uid" sudo -u "$u" osascript \
+            -e "display dialog \"$msg\" with title \"macrdp\" buttons {\"Open Accessibility Settings\", \"OK\"} default button \"OK\" giving up after 1800" \
+            -e "$open_settings"
     ) >/dev/null 2>&1 &
 done
 

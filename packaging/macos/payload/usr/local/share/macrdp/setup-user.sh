@@ -1,7 +1,8 @@
 #!/bin/bash
 # Sets up macrdp-server for one user: config, log folder, login agent.
 # Run as root: setup-user.sh <username>
-# Keeps an existing config; a new config gets a random password.
+# Keeps an existing config; a new config gets a random password until the
+# user chooses one (postinstall asks).
 set -euo pipefail
 
 USER_NAME="${1:?usage: setup-user.sh <username>}"
@@ -86,5 +87,5 @@ fi
 if [ -n "$NEW_PASSWORD" ]; then
     echo "macrdp: created $CONFIG for $USER_NAME (password is in that file)"
 fi
-# Hand the new password to the caller (postinstall shows it in a dialog).
+# Tell the caller a new config was made (postinstall then asks for a password).
 (umask 077; printf '%s' "$NEW_PASSWORD" > "/var/tmp/macrdp-newpw.$USER_ID") 2>/dev/null || true
