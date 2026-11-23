@@ -177,6 +177,10 @@ pub struct GfxState {
     pub rtt_min_ms: f64,
     /// Time between frames at the session's frame rate
     pub frame_interval_ms: f64,
+    /// Smoothed time between acknowledgements while the client has frames
+    /// queued: how fast the client really gets through frames (0 = unknown)
+    pub ack_interval_ms: f64,
+    last_ack_time: Option<std::time::Instant>,
     /// Per-window statistics for the QoE stats log line
     qoe_stats: QoeStats,
     /// Last acknowledged frame ID
@@ -233,6 +237,8 @@ impl GfxState {
             qoe_acks: false,
             rtt_min_ms: f64::INFINITY,
             frame_interval_ms: 1000.0 / 60.0,
+            ack_interval_ms: 0.0,
+            last_ack_time: None,
             qoe_stats: QoeStats::default(),
             last_ack_frame: 0,
             network_quality: 1.0,
@@ -325,12 +331,16 @@ impl GfxState {
     /// delay plus two frames of slack. Some clients (the Windows App) take
     /// 50-80 ms to acknowledge even with nothing queued; a fixed limit of 3
     /// made the server hold frames every second, which showed as stutter.
+    /// The delay is counted in frames at the client's own pace: a client that
+    /// shows 26 fps of a 60 fps stream keeps every allowed frame queued, so
+    /// counting at 60 fps let it run 5-8 frames (200-300 ms) behind.
     pub fn allowed_in_flight(&self, configured: u32) -> u32 {
         const MAX_ADAPTIVE: u32 = 10;
         if !self.rtt_min_ms.is_finite() {
             return configured;
         }
-        let pipeline = (self.rtt_min_ms / self.frame_interval_ms.max(1.0)).ceil() as u32;
+        let interval = self.frame_interval_ms.max(self.ack_interval_ms).max(1.0);
+        let pipeline = (self.rtt_min_ms / interval).ceil() as u32;
         configured.max((pipeline + 2).min(MAX_ADAPTIVE))
     }
 
@@ -358,6 +368,8 @@ impl GfxState {
         self.acks_received = 0;
         self.qoe_acks = false;
         self.rtt_min_ms = f64::INFINITY;
+        self.ack_interval_ms = 0.0;
+        self.last_ack_time = None;
         self.qoe_stats = QoeStats::default();
         self.rtt_ewma_ms = 0.0;
         self.forgive_outstanding();
@@ -413,6 +425,15 @@ impl GfxState {
         // Everything up to the acked frame is done, even if it wasn't acked itself
         self.frame_send_times.retain(|&id, _| id > ack_frame_id);
         self.pending_acks = self.frames_in_flight();
+
+        // Client pace: only while it still has frames queued, so idle gaps don't count
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.last_ack_time.replace(now) {
+            if self.pending_acks > 0 {
+                let dt = now.duration_since(prev).as_secs_f64() * 1000.0;
+                self.ack_interval_ms = if self.ack_interval_ms == 0.0 { dt } else { self.ack_interval_ms * 0.9 + dt * 0.1 };
+            }
+        }
 
         // Calculate RTT from send timestamp
         if let Some(send_time) = sent_at {
@@ -1167,5 +1188,15 @@ mod flow_control_tests {
             CapabilitySet::V10_5 { flags: CapabilitiesV104Flags::AVC_DISABLED },
         ];
         assert!(matches!(pick(&sets), Some(CapabilitySet::V8_1 { .. })));
+    }
+    #[test]
+    fn slow_client_gets_a_shorter_queue() {
+        let mut s = GfxState::new(1920, 1080, false);
+        s.rtt_min_ms = 75.0;
+        assert_eq!(s.allowed_in_flight(3), 7, "at the 60 fps send pace");
+        s.ack_interval_ms = 38.0; // client shows 26 fps
+        assert_eq!(s.allowed_in_flight(3), 4);
+        s.rtt_min_ms = 18.0;
+        assert_eq!(s.allowed_in_flight(3), 3);
     }
 }

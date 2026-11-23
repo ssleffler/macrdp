@@ -147,6 +147,7 @@ pub struct MacDisplay {
     mode_444: bool,
     show_cursor: bool,
     base_bitrate: u32,
+    bitrate_override: Option<u32>,
     gfx_state: Arc<Mutex<GfxState>>,
     /// Give each session its own display at the client's size (match_client_resolution)
     match_client: bool,
@@ -191,7 +192,7 @@ impl MacDisplay {
             native_logical,
             coord_mapper,
             fixed_resolution,
-            frame_rate, quality, encoder_pref, mode_444, show_cursor, base_bitrate, gfx_state,
+            frame_rate, quality, encoder_pref, mode_444, show_cursor, base_bitrate, bitrate_override, gfx_state,
             shared_audio_tx,
             perf_stats,
         }
@@ -276,9 +277,10 @@ impl RdpServerDisplay for MacDisplay {
             );
             self.width = w;
             self.height = h;
-            self.base_bitrate = macrdp_encode::screen_bitrate(
+            // A configured bitrate_mbps stays in force at the client's size too
+            self.base_bitrate = self.bitrate_override.unwrap_or_else(|| macrdp_encode::screen_bitrate(
                 w as u32, h as u32, self.frame_rate as f32, self.quality,
-            );
+            ));
             self.coord_mapper.update_rdp_size(w, h);
         }
     }
