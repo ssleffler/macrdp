@@ -90,6 +90,31 @@ EOF
         launchctl asuser "$uid" sudo -u "$u" osascript \
             -e "display dialog \"$msg\" with title \"macrdp\" buttons {\"Open Accessibility Settings\", \"OK\"} default button \"OK\" giving up after 1800" \
             -e "$open_settings"
+
+        # Offer access after a restart, unless this Mac is already set up for it.
+        # macrdp needs a logged-in desktop, so that means macOS automatic login
+        # (the user switches it on: it takes their login password) and, on
+        # desktop Macs, powering back on after a power failure.
+        auto_login=$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null)
+        power_on=$(pmset -g | awk '$1 == "autorestart" { print $2 }')
+        if [ -z "$auto_login" ] || [ "$power_on" = 0 ]; then
+            filevault=""
+            fdesetup status | grep -q "FileVault is On" && filevault="FileVault is on: macOS can't log in automatically until you turn it off."
+            answer=$(launchctl asuser "$uid" sudo -u "$u" osascript - "$u" "$filevault" <<'EOF'
+on run argv
+    set u to item 1 of argv
+    set msg to "Reach this Mac over RDP after a restart?" & linefeed & linefeed & "macrdp runs while " & u & " is logged in. Set Up makes that happen by itself:" & linefeed & "  • this Mac powers back on after a power failure" & linefeed & "  • Users & Groups opens: set \"Automatically log in as\" to " & u & linefeed & linefeed & "Anyone at this Mac then gets " & u & "'s desktop without a password until the screen locks."
+    if item 2 of argv is not "" then set msg to msg & linefeed & linefeed & item 2 of argv
+    set r to display dialog msg with title "macrdp" buttons {"Not Now", "Set Up"} default button "Not Now" giving up after 1800
+    return button returned of r
+end run
+EOF
+            )
+            if [ "$answer" = "Set Up" ]; then
+                pmset -a autorestart 1 || true
+                launchctl asuser "$uid" sudo -u "$u" open "x-apple.systempreferences:com.apple.Users-Groups-Settings.extension"
+            fi
+        fi
     ) >/dev/null 2>&1 &
 done
 

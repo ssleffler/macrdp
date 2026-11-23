@@ -19,7 +19,7 @@ This build includes:
 
 INSTALL
 -------
-1. Copy macrdp-0.2.14.pkg to the Mac and double-click it.
+1. Copy the macrdp .pkg file to the Mac and double-click it.
    (Build it with packaging/macos/build-pkg.sh; it lands in packaging/macos/dist/.)
 
    The package isn't signed by an Apple developer, so macOS blocks it the
@@ -41,7 +41,14 @@ INSTALL
    click "Set Password", or click "Open Config File" and set it there
    (macrdp restarts when you save). The RDP username is your Mac username.
 
-5. Check it worked:
+5. A last window offers access after a restart. macrdp needs a logged-in
+   desktop, so "Set Up" turns on power-on after a power failure and opens
+   Users & Groups, where you set "Automatically log in as" to your user
+   (FileVault must be off). Anyone at the Mac then gets that desktop without a
+   password until the screen locks. Skip it with "Not Now"; it is offered
+   again at the next install.
+
+6. Check it worked:
      grep -E "Screen Recording|Accessibility" ~/Library/Logs/macrdp/macrdp.log | tail -2
    Both lines should say [OK].
 
